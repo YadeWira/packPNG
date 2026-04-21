@@ -308,30 +308,38 @@ struct DeflParams { int level, strategy, memlevel, wbits; };
 
 static bool probe_deflate(const uint8_t* px, size_t pxsz,
                           const uint8_t* tgt, size_t tgtsz,
-                          int lv, int st, std::vector<uint8_t>& tmp)
+                          int lv, int st, int wbits, int memlevel,
+                          std::vector<uint8_t>& tmp)
 {
     size_t in = std::min(pxsz, PROBE_BYTES);
     z_stream zs{};
-    if (deflateInit2(&zs, lv, Z_DEFLATED, 15, 8, st) != Z_OK) return false;
+    if (deflateInit2(&zs, lv, Z_DEFLATED, wbits, memlevel, st) != Z_OK) return false;
     tmp.resize(deflateBound(&zs, in) + 16);
     zs.next_in   = const_cast<uint8_t*>(px);
     zs.avail_in  = (uInt)in;
     zs.next_out  = tmp.data();
     zs.avail_out = (uInt)tmp.size();
-    int r = (in < pxsz) ? deflate(&zs, Z_SYNC_FLUSH) : deflate(&zs, Z_FINISH);
+    bool partial  = (in < pxsz);
+    int r = partial ? deflate(&zs, Z_SYNC_FLUSH) : deflate(&zs, Z_FINISH);
     size_t olen = zs.total_out;
     deflateEnd(&zs);
     if (r < 0 || olen == 0) return false;
-    size_t cmp = std::min(olen, tgtsz);
+    // Z_SYNC_FLUSH appends up to 5 sync bytes that don't appear in the full stream.
+    // Strip them from the comparison to avoid false negatives on correct candidates.
+    static const size_t FLUSH_MARGIN = 8;
+    size_t safe = partial && olen > FLUSH_MARGIN ? olen - FLUSH_MARGIN : olen;
+    size_t cmp  = std::min(safe, tgtsz);
+    if (cmp == 0) return false;
     return memcmp(tmp.data(), tgt, cmp) == 0;
 }
 
 static bool full_deflate(const std::vector<uint8_t>& px,
                          const std::vector<uint8_t>& tgt,
-                         int lv, int st, std::vector<uint8_t>& out)
+                         int lv, int st, int wbits, int memlevel,
+                         std::vector<uint8_t>& out)
 {
     z_stream zs{};
-    if (deflateInit2(&zs, lv, Z_DEFLATED, 15, 8, st) != Z_OK) return false;
+    if (deflateInit2(&zs, lv, Z_DEFLATED, wbits, memlevel, st) != Z_OK) return false;
     out.resize(deflateBound(&zs, px.size()) + 16);
     zs.next_in   = const_cast<uint8_t*>(px.data());
     zs.avail_in  = (uInt)px.size();
@@ -344,10 +352,17 @@ static bool full_deflate(const std::vector<uint8_t>& px,
            memcmp(out.data(), tgt.data(), olen) == 0;
 }
 
-struct Candidate { int lv, st; };
+struct Candidate { int lv, st, wbits, memlevel; };
 
 static std::vector<Candidate> build_candidates(const std::vector<uint8_t>& target) {
     if (target.size() < 2) return {};
+
+    // CMF byte (target[0]): bits 4-7 = CINFO, wbits = CINFO + 8.
+    // Most encoders use wbits=15 (CINFO=7, CMF high nibble=7 → e.g. 0x78).
+    // Android/mobile often use wbits=14 (CMF=0x68) or 13 (CMF=0x58).
+    int cinfo = (target[0] >> 4) & 0xF;
+    int wbits  = std::max(8, std::min(15, cinfo + 8));
+
     uint8_t flevel = (target[1] >> 6) & 3;
     int lv_min, lv_max;
     switch (flevel) {
@@ -356,14 +371,24 @@ static std::vector<Candidate> build_candidates(const std::vector<uint8_t>& targe
         case 2: lv_min=6; lv_max=6; break;
         default:lv_min=7; lv_max=9; break;
     }
-    std::vector<Candidate> c;
-    // libpng default first
-    if (lv_min <= 6 && 6 <= lv_max) c.push_back({6, Z_FILTERED});
+
     static const int strats[] = {Z_DEFAULT_STRATEGY, Z_FILTERED, Z_HUFFMAN_ONLY, Z_RLE};
+    std::vector<Candidate> c;
+
+    // Primary: memlevel=8 (zlib default)
+    if (lv_min <= 6 && 6 <= lv_max) c.push_back({6, Z_FILTERED, wbits, 8});
     for (int lv = lv_min; lv <= lv_max; lv++)
         for (int st : strats)
             if (!(lv == 6 && st == Z_FILTERED))
-                c.push_back({lv, st});
+                c.push_back({lv, st, wbits, 8});
+
+    // Extended: memlevel=9 (some encoders; probe rejects quickly if wrong)
+    if (lv_min <= 6 && 6 <= lv_max) c.push_back({6, Z_FILTERED, wbits, 9});
+    for (int lv = lv_min; lv <= lv_max; lv++)
+        for (int st : strats)
+            if (!(lv == 6 && st == Z_FILTERED))
+                c.push_back({lv, st, wbits, 9});
+
     return c;
 }
 
@@ -378,10 +403,11 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
         // Sequential
         std::vector<uint8_t> tmp, attempt;
         for (auto& c : cands) {
-            if (!probe_deflate(px.data(), px.size(), tgt.data(), tgt.size(), c.lv, c.st, tmp))
+            if (!probe_deflate(px.data(), px.size(), tgt.data(), tgt.size(),
+                               c.lv, c.st, c.wbits, c.memlevel, tmp))
                 continue;
-            if (full_deflate(px, tgt, c.lv, c.st, attempt)) {
-                p = {c.lv, c.st, 8, 15}; return true;
+            if (full_deflate(px, tgt, c.lv, c.st, c.wbits, c.memlevel, attempt)) {
+                p = {c.lv, c.st, c.memlevel, c.wbits}; return true;
             }
         }
         return false;
@@ -401,11 +427,12 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
                 int idx = next_cand.fetch_add(1);
                 if (idx >= (int)cands.size()) break;
                 auto& c = cands[idx];
-                if (!probe_deflate(px.data(), px.size(), tgt.data(), tgt.size(), c.lv, c.st, tmp))
+                if (!probe_deflate(px.data(), px.size(), tgt.data(), tgt.size(),
+                                   c.lv, c.st, c.wbits, c.memlevel, tmp))
                     continue;
-                if (full_deflate(px, tgt, c.lv, c.st, attempt)) {
+                if (full_deflate(px, tgt, c.lv, c.st, c.wbits, c.memlevel, attempt)) {
                     std::lock_guard<std::mutex> lk(result_mu);
-                    if (!found) { result = {c.lv, c.st, 8, 15}; found = true; }
+                    if (!found) { result = {c.lv, c.st, c.memlevel, c.wbits}; found = true; }
                 }
             }
         });
@@ -473,9 +500,11 @@ static bool write_frame(const PngFrame& fr, std::vector<uint8_t>& ppg_out) {
     }
     ppg_out.push_back(fr.uses_idat ? 1 : 0);
     if (!fr.uses_idat) wr_le32(ppg_out, fr.first_seq);
-    ppg_out.push_back(matched ? 0 : 1);              // mode
-    ppg_out.push_back(matched ? (uint8_t)dp.level    : 0);
-    ppg_out.push_back(matched ? (uint8_t)dp.strategy : 0);
+    ppg_out.push_back(matched ? 0 : 1);                         // mode
+    ppg_out.push_back(matched ? (uint8_t)dp.level    : 0);     // level
+    ppg_out.push_back(matched ? (uint8_t)dp.strategy : 0);     // strategy
+    ppg_out.push_back(matched ? (uint8_t)dp.wbits    : 15);    // wbits (CMF-derived)
+    ppg_out.push_back(matched ? (uint8_t)dp.memlevel : 8);     // memlevel
 
     wr_le32(ppg_out, (uint32_t)fr.chunk_szs.size());
     for (uint32_t s : fr.chunk_szs) wr_le32(ppg_out, s);
@@ -514,13 +543,14 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
 /* ─── reconstruct deflate stream from stored frame data ─────────────────── */
 
 static bool rebuild_deflate(uint8_t mode, uint8_t level, uint8_t strategy,
+                            uint8_t wbits, uint8_t memlevel,
                             std::vector<uint8_t>& payload,
                             std::vector<uint8_t>& deflate_out)
 {
     if (mode == 0) {
         // mode match: re-deflate the pixels back to the original stream
         z_stream zs{};
-        if (deflateInit2(&zs, level, Z_DEFLATED, 15, 8, strategy) != Z_OK) {
+        if (deflateInit2(&zs, level, Z_DEFLATED, (int)wbits, (int)memlevel, strategy) != Z_OK) {
             snprintf(errormessage, MSG_SIZE, "deflateInit2 failed"); return false;
         }
         deflate_out.resize(deflateBound(&zs, payload.size()) + 16);
@@ -550,6 +580,7 @@ struct FrameMeta {
     bool     uses_idat;
     uint32_t first_seq;
     uint8_t  mode, level, strategy;
+    uint8_t  wbits = 15, memlevel = 8;
     std::vector<uint32_t> chunk_szs;
     std::vector<uint8_t>  payload;
 };
@@ -567,10 +598,12 @@ static bool read_frame_v2(const uint8_t* p, size_t sz, size_t& pos, FrameMeta& f
         if (pos + 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (first_seq)"); return false; }
         fm.first_seq = rd_le32(p + pos); pos += 4;
     }
-    if (pos + 3 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (mode/lv/st)"); return false; }
+    if (pos + 5 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (mode/lv/st/wb/ml)"); return false; }
     fm.mode     = p[pos++];
     fm.level    = p[pos++];
     fm.strategy = p[pos++];
+    fm.wbits    = p[pos++];
+    fm.memlevel = p[pos++];
 
     if (pos + 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (n_chunks)"); return false; }
     uint32_t nc = rd_le32(p + pos); pos += 4;
@@ -590,7 +623,8 @@ static bool read_frame_v2(const uint8_t* p, size_t sz, size_t& pos, FrameMeta& f
 static bool emit_idat_or_fdat(std::vector<uint8_t>& png_out, const FrameMeta& fm) {
     std::vector<uint8_t> payload_copy = fm.payload;
     std::vector<uint8_t> deflate_stream;
-    if (!rebuild_deflate(fm.mode, fm.level, fm.strategy, payload_copy, deflate_stream))
+    if (!rebuild_deflate(fm.mode, fm.level, fm.strategy, fm.wbits, fm.memlevel,
+                         payload_copy, deflate_stream))
         return false;
 
     size_t dpos = 0;
@@ -655,7 +689,7 @@ static bool decompress_ppg(const std::vector<uint8_t>& ppg_buf,
         std::vector<uint8_t> payload;
         if (!lzma_dec(p + pos, lzma_sz, payload, raw_sz)) return false;
         std::vector<uint8_t> deflate_stream;
-        if (!rebuild_deflate(mode, level, strategy, payload, deflate_stream)) return false;
+        if (!rebuild_deflate(mode, level, strategy, 15, 8, payload, deflate_stream)) return false;
         png_out.clear();
         wr_bytes(png_out, PNG_SIG, 8);
         wr_bytes(png_out, pre.data(), pre.size());
