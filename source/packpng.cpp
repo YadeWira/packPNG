@@ -35,9 +35,9 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "";
+static const char* subversion = ".3";
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   appversion = 2;   // v0.2
+static const int   appversion = 2;   // v0.2.3
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
 
@@ -100,6 +100,17 @@ static const char* R  = "\x1b[0m";
 static const char* BC = "\x1b[1;36m";
 static const char* GR = "\x1b[32m";
 static const char* RD = "\x1b[31m";
+static const char* YL = "\x1b[33m";
+
+static const char* strategy_name(int st) {
+    switch (st) {
+        case Z_DEFAULT_STRATEGY: return "default";
+        case Z_FILTERED:         return "filtered";
+        case Z_HUFFMAN_ONLY:     return "huffman";
+        case Z_RLE:              return "rle";
+        default:                 return "?";
+    }
+}
 
 /* ─── endian helpers ─────────────────────────────────────────────────────── */
 
@@ -311,24 +322,21 @@ static bool probe_deflate(const uint8_t* px, size_t pxsz,
                           int lv, int st, int wbits, int memlevel,
                           std::vector<uint8_t>& tmp)
 {
-    size_t in = std::min(pxsz, PROBE_BYTES);
+    // Use Z_FINISH on the full input with a small output buffer.
+    // Zlib stops writing when the buffer fills, but the bytes written are
+    // the exact prefix of the full compressed stream — no SYNC_FLUSH artefacts.
     z_stream zs{};
     if (deflateInit2(&zs, lv, Z_DEFLATED, wbits, memlevel, st) != Z_OK) return false;
-    tmp.resize(deflateBound(&zs, in) + 16);
+    tmp.resize(PROBE_BYTES + 128);
     zs.next_in   = const_cast<uint8_t*>(px);
-    zs.avail_in  = (uInt)in;
+    zs.avail_in  = (uInt)pxsz;
     zs.next_out  = tmp.data();
     zs.avail_out = (uInt)tmp.size();
-    bool partial  = (in < pxsz);
-    int r = partial ? deflate(&zs, Z_SYNC_FLUSH) : deflate(&zs, Z_FINISH);
+    deflate(&zs, Z_FINISH);   // Z_BUF_ERROR expected when buffer fills
     size_t olen = zs.total_out;
     deflateEnd(&zs);
-    if (r < 0 || olen == 0) return false;
-    // Z_SYNC_FLUSH appends up to 5 sync bytes that don't appear in the full stream.
-    // Strip them from the comparison to avoid false negatives on correct candidates.
-    static const size_t FLUSH_MARGIN = 8;
-    size_t safe = partial && olen > FLUSH_MARGIN ? olen - FLUSH_MARGIN : olen;
-    size_t cmp  = std::min(safe, tgtsz);
+    if (olen == 0) return false;
+    size_t cmp = std::min({olen, tgtsz, PROBE_BYTES});
     if (cmp == 0) return false;
     return memcmp(tmp.data(), tgt, cmp) == 0;
 }
@@ -365,9 +373,10 @@ static std::vector<Candidate> build_candidates(const std::vector<uint8_t>& targe
 
     uint8_t flevel = (target[1] >> 6) & 3;
     int lv_min, lv_max;
+    // zlib level→FLEVEL: 1→0, 2-5→1, 6→2, 7-9→3
     switch (flevel) {
-        case 0: lv_min=1; lv_max=2; break;
-        case 1: lv_min=3; lv_max=5; break;
+        case 0: lv_min=1; lv_max=1; break;
+        case 1: lv_min=2; lv_max=5; break;
         case 2: lv_min=6; lv_max=6; break;
         default:lv_min=7; lv_max=9; break;
     }
@@ -489,6 +498,18 @@ static bool write_frame(const PngFrame& fr, std::vector<uint8_t>& ppg_out) {
 
     std::vector<uint8_t> lzma_data;
     if (!lzma_enc(payload, paysz, lzma_data)) return false;
+
+    if (verbosity >= 1) {
+        std::lock_guard<std::mutex> lk(g_print_mutex);
+        if (matched)
+            fprintf(stdout, "  %s[match]%s  lv=%d st=%s wb=%d ml=%d  px=%zu  idat=%zu  →lzma=%zu\n",
+                    col(GR), col(R), dp.level, strategy_name(dp.strategy),
+                    dp.wbits, dp.memlevel,
+                    fr.pixels.size(), fr.idat_raw.size(), lzma_data.size());
+        else
+            fprintf(stdout, "  %s[stored]%s  idat=%zu  →lzma=%zu\n",
+                    col(YL), col(R), fr.idat_raw.size(), lzma_data.size());
+    }
 
     // Frame header
     ppg_out.push_back(fr.fctl.empty() ? 0 : 1);
@@ -884,6 +905,84 @@ static void collect(const std::string& path) {
     }
 }
 
+/* ─── list PPG info ──────────────────────────────────────────────────────── */
+
+static void list_ppg(const std::string& path) {
+    namespace fs = std::filesystem;
+    auto buf = read_file(path);
+    if (buf.size() < 5 || memcmp(buf.data(), PPG_SIG, 4) != 0) {
+        fprintf(stdout, "%s%s%s: not a PPG file\n", col(RD), path.c_str(), col(R));
+        return;
+    }
+    size_t pos = 4;
+    uint8_t version = buf[pos++];
+    size_t file_sz = fs::exists(path) ? (size_t)fs::file_size(path) : buf.size();
+
+    fprintf(stdout, "%s%s%s  (%zu B)\n", col(BC), path.c_str(), col(R), file_sz);
+
+    if (version == 1) {
+        if (pos + 3 > buf.size()) { fprintf(stdout, "  truncated\n"); return; }
+        uint8_t mode=buf[pos++], lv=buf[pos++], st=buf[pos++];
+        uint32_t ni = rd_le32(buf.data()+pos); pos+=4; pos+=ni*4;
+        uint64_t pre_sz=rd_le64(buf.data()+pos); pos+=8; pos+=pre_sz;
+        uint64_t suf_sz=rd_le64(buf.data()+pos); pos+=8; pos+=suf_sz;
+        uint64_t raw_sz=rd_le64(buf.data()+pos); pos+=8;
+        uint64_t lzma_sz=rd_le64(buf.data()+pos);
+        fprintf(stdout, "  PPG v1  PNG  1 frame\n");
+        fprintf(stdout, "  Frame 0: [%s] lv=%u st=%s  raw=%llu  lzma=%llu\n",
+                mode==0?"match":"stored", lv, strategy_name(st),
+                (unsigned long long)raw_sz, (unsigned long long)lzma_sz);
+        fprintf(stdout, "  pre=%lluB  suf=%lluB\n",
+                (unsigned long long)pre_sz, (unsigned long long)suf_sz);
+        return;
+    }
+
+    if (version != 2) {
+        fprintf(stdout, "  unknown PPG version %u\n", version); return;
+    }
+
+    bool is_apng   = (buf[pos++] & 1) != 0;
+    uint32_t plays = rd_le32(buf.data()+pos); pos+=4;
+    uint64_t pre_sz=rd_le64(buf.data()+pos); pos+=8; pos+=pre_sz;
+    uint64_t post_sz=rd_le64(buf.data()+pos); pos+=8; pos+=post_sz;
+    uint32_t nf   = rd_le32(buf.data()+pos); pos+=4;
+
+    if (is_apng)
+        fprintf(stdout, "  PPG v2  APNG  %u frame(s)  loops=%u  pre=%lluB  post=%lluB\n",
+                nf, plays, (unsigned long long)pre_sz, (unsigned long long)post_sz);
+    else
+        fprintf(stdout, "  PPG v2  PNG   %u frame(s)  pre=%lluB  post=%lluB\n",
+                nf, (unsigned long long)pre_sz, (unsigned long long)post_sz);
+
+    for (uint32_t i = 0; i < nf && pos < buf.size(); i++) {
+        bool has_fctl = buf[pos++] != 0;
+        if (has_fctl && pos+26 <= buf.size()) pos+=26;
+        bool uses_idat = buf[pos++] != 0;
+        if (!uses_idat && pos+4 <= buf.size()) pos+=4;
+        if (pos+5 > buf.size()) break;
+        uint8_t mode=buf[pos++], lv=buf[pos++], st=buf[pos++];
+        uint8_t wb=buf[pos++], ml=buf[pos++];
+        if (pos+4 > buf.size()) break;
+        uint32_t nc=rd_le32(buf.data()+pos); pos+=4;
+        pos+=nc*4;
+        if (pos+16 > buf.size()) break;
+        uint64_t raw_sz =rd_le64(buf.data()+pos); pos+=8;
+        uint64_t lzma_sz=rd_le64(buf.data()+pos); pos+=8;
+        pos+=lzma_sz;
+
+        const char* modestr = (mode==0) ? "match " : "stored";
+        const char* mcol    = (mode==0) ? col(GR)  : col(YL);
+        fprintf(stdout,
+                "  Frame %u: %s[%s]%s %s  lv=%u st=%-8s wb=%u ml=%u"
+                "  raw=%llu  lzma=%llu (%.1f%%)\n",
+                i, mcol, modestr, col(R),
+                uses_idat ? "IDAT" : "fdAT",
+                lv, strategy_name(st), wb, ml,
+                (unsigned long long)raw_sz, (unsigned long long)lzma_sz,
+                raw_sz > 0 ? 100.0*lzma_sz/raw_sz : 0.0);
+    }
+}
+
 /* ─── show help ──────────────────────────────────────────────────────────── */
 
 static void show_help() {
@@ -894,7 +993,8 @@ static void show_help() {
         "Subcommands:\n"
         "  a            compress only (.png/.apng → .ppg)\n"
         "  x            decompress only (.ppg → .png/.apng)\n"
-        "  mix          both directions (default)\n\n"
+        "  mix          both directions (default)\n"
+        "  l / list     inspect .ppg files (no decompression)\n\n"
         "Flags:\n"
         "  -ver         verify round-trip after processing\n"
         "  -v0/-v1/-v2  verbosity (default 0)\n"
@@ -924,12 +1024,14 @@ int main(int argc, char** argv)
     init_colors();
     if (argc < 2) { show_help(); return 0; }
 
+    bool list_mode = false;
     int ai = 1;
     {
         std::string s = argv[1];
-        if      (s == "a")   { compress_only   = true; ai++; }
-        else if (s == "x")   { decompress_only = true; ai++; }
-        else if (s == "mix") { ai++; }
+        if      (s == "a")              { compress_only   = true; ai++; }
+        else if (s == "x")              { decompress_only = true; ai++; }
+        else if (s == "mix")            { ai++; }
+        else if (s == "l" || s == "list"){ list_mode = true; ai++; }
     }
 
     for (; ai < argc; ai++) {
@@ -979,6 +1081,13 @@ int main(int argc, char** argv)
     if (!module_mode) {
         fprintf(stdout, "\n%spackPNG%s v0.%i%s  •  by %s\n\n",
                 col(BC), col(R), appversion, subversion, author);
+    }
+
+    // List mode: inspect .ppg files without decompressing
+    if (list_mode) {
+        for (auto& f : filelist) list_ppg(f);
+        if (wait_exit && !module_mode) { fprintf(stdout, "\nPress <enter> to quit\n"); getchar(); }
+        return 0;
     }
 
     auto t0 = std::chrono::steady_clock::now();
