@@ -35,7 +35,7 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = ".3";
+static const char* subversion = ".4";
 static const char* author     = "Yade Bravo (YadeWira)";
 static const int   appversion = 2;   // v0.2.3
 
@@ -851,16 +851,23 @@ static void process_file(const std::string& inpath) {
         std::vector<uint8_t> rt;
         bool vok;
         if (do_compress) {
+            // Verify compress: decompress the PPG we just produced → must equal original PNG
             vok = decompress_ppg(out, rt);
+            if (!vok || rt != in) {
+                std::lock_guard<std::mutex> lk(g_print_mutex);
+                fprintf(stderr, "%sERROR%s %s: round-trip mismatch\n", col(RD), col(R), inpath.c_str());
+                g_errors++;
+                return;
+            }
         } else {
-            std::vector<uint8_t> tmp;
-            vok = compress_png(out, tmp) && decompress_ppg(tmp, rt);
-        }
-        if (!vok || rt != in) {
-            std::lock_guard<std::mutex> lk(g_print_mutex);
-            fprintf(stderr, "%sERROR%s %s: round-trip mismatch\n", col(RD), col(R), inpath.c_str());
-            g_errors++;
-            return;
+            // Verify decompress: re-decompress the same PPG → must equal what we just wrote
+            vok = decompress_ppg(in, rt);
+            if (!vok || rt != out) {
+                std::lock_guard<std::mutex> lk(g_print_mutex);
+                fprintf(stderr, "%sERROR%s %s: round-trip mismatch\n", col(RD), col(R), inpath.c_str());
+                g_errors++;
+                return;
+            }
         }
     }
 
