@@ -35,7 +35,7 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = ".4";
+static const char* subversion = ".5";
 static const char* author     = "Yade Bravo (YadeWira)";
 static const int   appversion = 2;   // v0.2.3
 
@@ -322,9 +322,30 @@ static bool probe_deflate(const uint8_t* px, size_t pxsz,
                           int lv, int st, int wbits, int memlevel,
                           std::vector<uint8_t>& tmp)
 {
-    // Use Z_FINISH on the full input with a small output buffer.
-    // Zlib stops writing when the buffer fills, but the bytes written are
-    // the exact prefix of the full compressed stream — no SYNC_FLUSH artefacts.
+    // Phase 1 – quick pre-filter: produce 256 bytes of output.
+    // Wrong candidates typically diverge within the first few bytes of compressed
+    // data (right after the 2-byte header). This avoids the full PROBE_BYTES
+    // deflation for candidates that can be ruled out cheaply.
+    {
+        static const size_t QUICK = 256;
+        z_stream q{};
+        if (deflateInit2(&q, lv, Z_DEFLATED, wbits, memlevel, st) != Z_OK) return false;
+        uint8_t qbuf[QUICK + 8];
+        q.next_in   = const_cast<uint8_t*>(px);
+        q.avail_in  = (uInt)pxsz;
+        q.next_out  = qbuf;
+        q.avail_out = sizeof(qbuf);
+        deflate(&q, Z_FINISH);
+        size_t qlen = q.total_out;
+        deflateEnd(&q);
+        if (qlen >= 3) {
+            size_t cmp = std::min({qlen, tgtsz, QUICK});
+            if (memcmp(qbuf, tgt, cmp) != 0) return false;
+        }
+    }
+    // Phase 2 – full probe: produce PROBE_BYTES of output.
+    // Z_FINISH on the full input; zlib stops when the buffer fills, so the bytes
+    // written are the exact prefix of the complete compressed stream.
     z_stream zs{};
     if (deflateInit2(&zs, lv, Z_DEFLATED, wbits, memlevel, st) != Z_OK) return false;
     tmp.resize(PROBE_BYTES + 128);
@@ -332,7 +353,7 @@ static bool probe_deflate(const uint8_t* px, size_t pxsz,
     zs.avail_in  = (uInt)pxsz;
     zs.next_out  = tmp.data();
     zs.avail_out = (uInt)tmp.size();
-    deflate(&zs, Z_FINISH);   // Z_BUF_ERROR expected when buffer fills
+    deflate(&zs, Z_FINISH);
     size_t olen = zs.total_out;
     deflateEnd(&zs);
     if (olen == 0) return false;
@@ -881,10 +902,14 @@ static void process_file(const std::string& inpath) {
     double ratio = in_sz > 0 ? 100.0 * out.size() / in_sz : 0.0;
     {
         std::lock_guard<std::mutex> lk(g_print_mutex);
-        if (!module_mode)
-            fprintf(stdout, "%s%s%s -> %s%s%s  %.2f%%\n",
-                    col(GR), inpath.c_str(), col(R),
-                    col(GR), outpath.c_str(), col(R), ratio);
+        if (!module_mode) {
+            bool expanded = (ratio > 100.0);
+            const char* pc = expanded ? col(YL) : col(GR);
+            fprintf(stdout, "%s%s%s -> %s%s%s  %.2f%%%s\n",
+                    pc, inpath.c_str(), col(R),
+                    pc, outpath.c_str(), col(R), ratio,
+                    expanded ? " [incompressible — consider skipping]" : "");
+        }
     }
     g_processed++;
     // Atomic double add via CAS loop
