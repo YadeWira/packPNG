@@ -1,11 +1,13 @@
-/* packPNG v0.3 - PNG/APNG lossless recompressor
+/* packPNG v0.4 - PNG/APNG lossless recompressor
  *
  * Per-frame algorithm:
  *   PNG/APNG → parse frames → inflate pixels → brute-force zlib re-encode
- *   → solid LZMA (all frames in one block) → .ppg   (mode 0 = match)
- *   If no match: store original deflate stream → solid LZMA → .ppg  (mode 1 = stored)
+ *   → filter-byte separation → solid LZMA (all frames in one block) → .ppg
  *
- * PPG format v3: solid LZMA across all frames; v1/v2 files still decompressable.
+ * PPG format v4: filter bytes separated from pixel data before LZMA
+ *   → LZ77 no pierde matches por bytes de filter intercalados
+ * PPG v3: solid LZMA (sin sep); v1/v2: per-frame LZMA. Todos legibles.
+ *
  * CLI mirrors packJPG v4.x.
  * Targets: Linux x86-64, Windows 10/11 x86-64.
  * Deps: zlib, liblzma.
@@ -37,7 +39,7 @@
 
 static const char* subversion = "";   // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   appversion = 3;   // v0.3
+static const int   appversion = 4;   // v0.4
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
 
@@ -57,15 +59,15 @@ static bool compress_only   = false;
 static bool decompress_only = false;
 static bool wait_exit       = true;
 static bool no_color        = false;
-static bool sfth            = false;  // parallel brute-force within one file
-static bool lzma_extreme    = false;  // LZMA_PRESET_EXTREME flag
+static bool sfth            = false;
+static bool lzma_extreme    = false;
 static int  verbosity       = 0;
-static int  num_threads     = 1;      // file-level threads (-th)
-static int  sfth_threads    = 1;      // brute-force threads (-sfth, set post-parse)
+static int  num_threads     = 1;
+static int  sfth_threads    = 1;
 static unsigned g_lzma_preset = 6u;
 static std::string outdir;
 
-static std::mutex g_print_mutex;      // serialise stdout when -th > 1
+static std::mutex g_print_mutex;
 
 static int err_tol = 1;
 thread_local char errormessage[MSG_SIZE] = "no error";
@@ -173,22 +175,109 @@ static std::vector<uint8_t> chunk_bytes(const PngChunk& c) {
 /* ─── PNG/APNG frame ─────────────────────────────────────────────────────── */
 
 struct PngFrame {
-    // 26-byte fcTL chunk data (sequence_number…blend_op), empty if none.
-    std::vector<uint8_t> fctl;
-    bool     uses_idat = true;  // true = IDAT chunks, false = fdAT chunks
-    uint32_t first_seq = 0;     // first fdAT sequence number (only when !uses_idat)
-    std::vector<uint32_t> chunk_szs;  // per-chunk payload size (fdAT: excl. 4-byte seq)
-    std::vector<uint8_t>  idat_raw;   // concatenated payloads
-    std::vector<uint8_t>  pixels;     // inflated pixel data
+    std::vector<uint8_t> fctl;      // 26-byte fcTL data, empty if none
+    bool     uses_idat = true;
+    uint32_t first_seq = 0;
+    std::vector<uint32_t> chunk_szs;
+    std::vector<uint8_t>  idat_raw;
+    std::vector<uint8_t>  pixels;   // inflated filtered scanlines
 };
 
 struct PngInfo {
     bool     is_apng   = false;
     uint32_t num_plays = 0;
     std::vector<PngFrame> frames;
-    std::vector<uint8_t>  pre;   // chunks before first fcTL/IDAT (IHDR, acTL, …)
-    std::vector<uint8_t>  post;  // chunks after last frame (IEND, …)
+    std::vector<uint8_t>  pre;
+    std::vector<uint8_t>  post;
 };
+
+/* ─── IHDR helpers ───────────────────────────────────────────────────────── */
+
+struct IhdrInfo {
+    uint32_t width = 0, height = 0;
+    uint8_t  bit_depth = 8, color_type = 2;
+};
+
+// Returns bpp (bytes per pixel) for filter-byte separation. Returns 0 when
+// separation doesn't make sense (palette, sub-byte depth, etc.).
+static uint32_t compute_bpp(uint8_t color_type, uint8_t bit_depth) {
+    if (bit_depth != 8 && bit_depth != 16) return 0;  // sub-byte or unusual
+    uint32_t b = (bit_depth == 16) ? 2 : 1;
+    switch (color_type) {
+        case 0: return b;      // grayscale
+        case 2: return 3 * b;  // RGB
+        case 4: return 2 * b;  // grayscale+alpha
+        case 6: return 4 * b;  // RGBA
+        default: return 0;     // palette (type 3) or unknown
+    }
+}
+
+// Parse IHDR from pre-chunk bytes (PNG_SIG already stripped).
+// pre = raw chunk bytes starting with IHDR chunk.
+static IhdrInfo parse_ihdr(const std::vector<uint8_t>& pre) {
+    IhdrInfo info;
+    // IHDR: 4 (length) + 4 (type) + 13 (data) + 4 (crc) = 25 bytes minimum
+    if (pre.size() < 25) return info;
+    // first 4 bytes = length, next 4 = "IHDR"
+    if (memcmp(pre.data() + 4, "IHDR", 4) != 0) return info;
+    const uint8_t* d = pre.data() + 8;  // IHDR data
+    info.width      = rd_be32(d);
+    info.height     = rd_be32(d + 4);
+    info.bit_depth  = d[8];
+    info.color_type = d[9];
+    return info;
+}
+
+// Get frame dimensions: from fcTL if present, else from IHDR.
+static void frame_dims(const PngFrame& fr, const IhdrInfo& base,
+                       uint32_t& out_w, uint32_t& out_h) {
+    if (fr.fctl.size() >= 12) {
+        out_w = rd_be32(fr.fctl.data() + 4);
+        out_h = rd_be32(fr.fctl.data() + 8);
+    } else {
+        out_w = base.width;
+        out_h = base.height;
+    }
+}
+
+/* ─── filter-byte separation ─────────────────────────────────────────────── */
+
+// Separate filter bytes (1 per scanline) from pixel bytes.
+// pixels = [filter][stride bytes][filter][stride bytes]...
+// Output: filter_bytes (n_scanlines), px_only (n_scanlines × stride).
+static bool sep_filters(const std::vector<uint8_t>& pixels, uint32_t stride,
+                        std::vector<uint8_t>& filter_bytes,
+                        std::vector<uint8_t>& px_only)
+{
+    if (stride == 0) return false;
+    size_t row_bytes = stride + 1;
+    if (pixels.size() % row_bytes != 0) return false;
+    size_t n = pixels.size() / row_bytes;
+    filter_bytes.resize(n);
+    px_only.resize(n * stride);
+    for (size_t r = 0; r < n; r++) {
+        filter_bytes[r] = pixels[r * row_bytes];
+        memcpy(px_only.data() + r * stride,
+               pixels.data() + r * row_bytes + 1, stride);
+    }
+    return true;
+}
+
+// Reconstruct pixels from separated filter bytes + pixel bytes.
+static bool unsep_filters(const uint8_t* filter_bytes, size_t n_scanlines,
+                           const uint8_t* px_only, size_t stride,
+                           std::vector<uint8_t>& pixels)
+{
+    if (stride == 0 || n_scanlines == 0) return false;
+    size_t row_bytes = stride + 1;
+    pixels.resize(n_scanlines * row_bytes);
+    for (size_t r = 0; r < n_scanlines; r++) {
+        pixels[r * row_bytes] = filter_bytes[r];
+        memcpy(pixels.data() + r * row_bytes + 1,
+               px_only + r * stride, stride);
+    }
+    return true;
+}
 
 /* ─── inflate one frame ──────────────────────────────────────────────────── */
 
@@ -224,7 +313,6 @@ static bool parse_png(const std::vector<uint8_t>& buf, PngInfo& info) {
         snprintf(errormessage, MSG_SIZE, "bad PNG signature"); return false;
     }
 
-    // Read raw chunks
     std::vector<PngChunk> chunks;
     size_t pos = 8;
     while (pos + 12 <= buf.size()) {
@@ -245,30 +333,28 @@ static bool parse_png(const std::vector<uint8_t>& buf, PngInfo& info) {
         if (chunk_is(chunks.back(), "IEND")) break;
     }
 
-    // State machine: BEFORE → IN_IDAT → IN_FDAT
     enum State { BEFORE, IN_IDAT, IN_FDAT } state = BEFORE;
     PngFrame cur;
     cur.uses_idat = true;
-    std::vector<uint8_t> post_acc;  // ancillary chunks after IDAT/fdAT, before IEND
+    std::vector<uint8_t> post_acc;
 
     for (auto& c : chunks) {
         if (chunk_is(c, "acTL")) {
-            info.is_apng   = true;
+            info.is_apng = true;
             if (c.data.size() >= 8) info.num_plays = rd_be32(c.data.data() + 4);
             auto cb = chunk_bytes(c);
             info.pre.insert(info.pre.end(), cb.begin(), cb.end());
 
         } else if (chunk_is(c, "fcTL")) {
             if (state == BEFORE) {
-                cur.fctl = c.data;   // frame 0 is animated
+                cur.fctl = c.data;
             } else {
-                // flush current frame
                 if (!inflate_frame(cur)) return false;
                 info.frames.push_back(std::move(cur));
                 cur = PngFrame();
-                cur.fctl       = c.data;
-                cur.uses_idat  = false;
-                cur.first_seq  = (c.data.size() >= 4) ? rd_be32(c.data.data()) + 1 : 0;
+                cur.fctl      = c.data;
+                cur.uses_idat = false;
+                cur.first_seq = (c.data.size() >= 4) ? rd_be32(c.data.data()) + 1 : 0;
                 state = IN_FDAT;
             }
 
@@ -293,13 +379,11 @@ static bool parse_png(const std::vector<uint8_t>& buf, PngInfo& info) {
                 if (!inflate_frame(cur)) return false;
                 info.frames.push_back(std::move(cur));
             }
-            // post = any inter-frame ancillary chunks + IEND
             auto cb = chunk_bytes(c);
             info.post = post_acc;
             info.post.insert(info.post.end(), cb.begin(), cb.end());
 
         } else {
-            // Ancillary chunk
             auto cb = chunk_bytes(c);
             if (state == BEFORE)
                 info.pre.insert(info.pre.end(), cb.begin(), cb.end());
@@ -323,7 +407,7 @@ static bool probe_deflate(const uint8_t* px, size_t pxsz,
                           int lv, int st, int wbits, int memlevel,
                           std::vector<uint8_t>& tmp)
 {
-    // Phase 1 – quick pre-filter: produce 256 bytes of output.
+    // Phase 1 – quick pre-filter: 256 bytes
     {
         static const size_t QUICK = 256;
         z_stream q{};
@@ -341,7 +425,7 @@ static bool probe_deflate(const uint8_t* px, size_t pxsz,
             if (memcmp(qbuf, tgt, cmp) != 0) return false;
         }
     }
-    // Phase 2 – full probe: produce PROBE_BYTES of output.
+    // Phase 2 – full probe: PROBE_BYTES
     z_stream zs{};
     if (deflateInit2(&zs, lv, Z_DEFLATED, wbits, memlevel, st) != Z_OK) return false;
     tmp.resize(PROBE_BYTES + 128);
@@ -382,7 +466,6 @@ struct Candidate { int lv, st, wbits, memlevel; };
 static std::vector<Candidate> build_candidates(const std::vector<uint8_t>& target) {
     if (target.size() < 2) return {};
 
-    // CMF byte (target[0]): bits 4-7 = CINFO, wbits = CINFO + 8.
     int cinfo  = (target[0] >> 4) & 0xF;
     int wbits0 = std::max(8, std::min(15, cinfo + 8));
 
@@ -398,7 +481,6 @@ static std::vector<Candidate> build_candidates(const std::vector<uint8_t>& targe
     static const int strats[] = {Z_DEFAULT_STRATEGY, Z_FILTERED, Z_HUFFMAN_ONLY, Z_RLE};
     std::vector<Candidate> c;
 
-    // Helper: add a full level×strategy sweep for given wbits+memlevel
     auto add_sweep = [&](int wb, int ml) {
         if (lv_min <= 6 && 6 <= lv_max) c.push_back({6, Z_FILTERED, wb, ml});
         for (int lv = lv_min; lv <= lv_max; lv++)
@@ -407,14 +489,10 @@ static std::vector<Candidate> build_candidates(const std::vector<uint8_t>& targe
                     c.push_back({lv, st, wb, ml});
     };
 
-    // Primary: CMF-derived wbits, memlevel 8 (most common default)
     add_sweep(wbits0, 8);
-    // Extended: memlevel 9 (slightly less common)
     add_sweep(wbits0, 9);
-    // Rare: memlevel 1-7 (unusual encoders); probe phase-1 rejects quickly
     for (int ml = 7; ml >= 1; ml--)
         add_sweep(wbits0, ml);
-    // Fallback: wbits=15 if CMF-derived differs (some buggy encoders)
     if (wbits0 != 15) {
         add_sweep(15, 8);
         add_sweep(15, 9);
@@ -443,7 +521,6 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
         return false;
     }
 
-    // Parallel brute-force (-sfth)
     std::atomic<bool> found{false};
     std::atomic<int>  next_cand{0};
     std::mutex        result_mu;
@@ -507,12 +584,15 @@ static bool lzma_dec(const uint8_t* in, size_t insz,
     return true;
 }
 
-/* ─── compress PNG/APNG → PPG v3 (solid LZMA) ───────────────────────────── */
+/* ─── compress PNG/APNG → PPG v4 (solid LZMA + filter separation) ───────── */
 
 struct FrameEnc {
     bool       matched;
     DeflParams dp;
-    size_t     payload_sz;  // pixels.size() when matched, idat_raw.size() otherwise
+    bool       filter_sep;   // filter-byte separation applied
+    uint32_t   stride;       // bytes per scanline (excl. filter byte)
+    uint32_t   n_scanlines;
+    size_t     payload_sz;   // total bytes contributed to solid block
 };
 
 static bool compress_png(const std::vector<uint8_t>& png_buf,
@@ -521,15 +601,40 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
     PngInfo info;
     if (!parse_png(png_buf, info)) return false;
 
-    // Phase 1: find deflate params for each frame
+    IhdrInfo ihdr = parse_ihdr(info.pre);
+    uint32_t bpp  = compute_bpp(ihdr.color_type, ihdr.bit_depth);
+
     std::vector<FrameEnc> enc;
     enc.reserve(info.frames.size());
+
+    // Temporary storage for separated pixel data (to avoid holding two copies)
+    std::vector<std::vector<uint8_t>> sep_filter_bufs(info.frames.size());
+    std::vector<std::vector<uint8_t>> sep_pixel_bufs(info.frames.size());
+
     size_t total_payload = 0;
 
-    for (auto& fr : info.frames) {
-        FrameEnc fe;
+    for (size_t i = 0; i < info.frames.size(); i++) {
+        auto& fr = info.frames[i];
+        FrameEnc fe{};
         fe.matched = !fr.pixels.empty() &&
                      find_deflate_params(fr.pixels, fr.idat_raw, fe.dp);
+
+        // Filter separation: only on matched frames where we have inflated pixels
+        fe.filter_sep = false;
+        if (fe.matched && bpp > 0) {
+            uint32_t fw, fh;
+            frame_dims(fr, ihdr, fw, fh);
+            fe.stride      = fw * bpp;
+            fe.n_scanlines = fh;
+            if (fe.stride > 0 && fe.n_scanlines > 0) {
+                if (sep_filters(fr.pixels, fe.stride,
+                                sep_filter_bufs[i], sep_pixel_bufs[i])) {
+                    fe.filter_sep = true;
+                    // payload = filter_bytes + pixel_bytes (same total as pixels.size())
+                }
+            }
+        }
+
         fe.payload_sz = fe.matched ? fr.pixels.size() : fr.idat_raw.size();
         total_payload += fe.payload_sz;
 
@@ -537,10 +642,11 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
             std::lock_guard<std::mutex> lk(g_print_mutex);
             if (fe.matched)
                 fprintf(stdout,
-                    "  %s[match]%s  lv=%d st=%s wb=%d ml=%d  px=%zu  idat=%zu\n",
+                    "  %s[match]%s  lv=%d st=%s wb=%d ml=%d  px=%zu  idat=%zu%s\n",
                     col(GR), col(R), fe.dp.level, strategy_name(fe.dp.strategy),
                     fe.dp.wbits, fe.dp.memlevel,
-                    fr.pixels.size(), fr.idat_raw.size());
+                    fr.pixels.size(), fr.idat_raw.size(),
+                    fe.filter_sep ? "  [fsep]" : "");
             else
                 fprintf(stdout, "  %s[stored]%s  idat=%zu\n",
                     col(YL), col(R), fr.idat_raw.size());
@@ -548,14 +654,24 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
         enc.push_back(fe);
     }
 
-    // Phase 2: concatenate all payloads → one solid LZMA block
+    // Build solid LZMA input:
+    // - For filter-separated frames: [filter_bytes][pixel_bytes]
+    // - For matched non-sep frames: [pixels as-is]
+    // - For stored frames: [idat_raw as-is]
     std::vector<uint8_t> combined;
     combined.reserve(total_payload);
     for (size_t i = 0; i < info.frames.size(); i++) {
         auto& fr = info.frames[i];
         auto& fe = enc[i];
-        const uint8_t* p = fe.matched ? fr.pixels.data() : fr.idat_raw.data();
-        combined.insert(combined.end(), p, p + fe.payload_sz);
+        if (fe.filter_sep) {
+            combined.insert(combined.end(),
+                            sep_filter_bufs[i].begin(), sep_filter_bufs[i].end());
+            combined.insert(combined.end(),
+                            sep_pixel_bufs[i].begin(), sep_pixel_bufs[i].end());
+        } else {
+            const uint8_t* p = fe.matched ? fr.pixels.data() : fr.idat_raw.data();
+            combined.insert(combined.end(), p, p + fe.payload_sz);
+        }
     }
 
     std::vector<uint8_t> lzma_data;
@@ -568,11 +684,11 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
                 total_payload > 0 ? 100.0 * lzma_data.size() / total_payload : 0.0);
     }
 
-    // Phase 3: write PPG v3
+    // Write PPG v4
     ppg_out.clear();
     wr_bytes(ppg_out, PPG_SIG, 4);
-    ppg_out.push_back(3);                               // format version
-    ppg_out.push_back(info.is_apng ? 1 : 0);           // flags
+    ppg_out.push_back(4);                               // format version
+    ppg_out.push_back(info.is_apng ? 1 : 0);
     wr_le32(ppg_out, info.num_plays);
     wr_le64(ppg_out, (uint64_t)info.pre.size());
     wr_bytes(ppg_out, info.pre.data(), info.pre.size());
@@ -599,7 +715,13 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
         ppg_out.push_back(fe.matched ? (uint8_t)fe.dp.memlevel : 8);
         wr_le32(ppg_out, (uint32_t)fr.chunk_szs.size());
         for (uint32_t s : fr.chunk_szs) wr_le32(ppg_out, s);
-        wr_le64(ppg_out, (uint64_t)fe.payload_sz);  // size of this frame in solid block
+        wr_le64(ppg_out, (uint64_t)fe.payload_sz);
+        // Filter separation metadata (v4 addition)
+        ppg_out.push_back(fe.filter_sep ? 1 : 0);
+        if (fe.filter_sep) {
+            wr_le32(ppg_out, fe.stride);
+            wr_le32(ppg_out, fe.n_scanlines);
+        }
     }
 
     // Solid LZMA block
@@ -610,7 +732,7 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
     return true;
 }
 
-/* ─── reconstruct deflate stream from stored frame data ─────────────────── */
+/* ─── reconstruct deflate stream ─────────────────────────────────────────── */
 
 static bool rebuild_deflate(uint8_t mode, uint8_t level, uint8_t strategy,
                             uint8_t wbits, uint8_t memlevel,
@@ -618,7 +740,6 @@ static bool rebuild_deflate(uint8_t mode, uint8_t level, uint8_t strategy,
                             std::vector<uint8_t>& deflate_out)
 {
     if (mode == 0) {
-        // mode match: re-deflate the pixels back to the original stream
         z_stream zs{};
         if (deflateInit2(&zs, level, Z_DEFLATED, (int)wbits, (int)memlevel, strategy) != Z_OK) {
             snprintf(errormessage, MSG_SIZE, "deflateInit2 failed"); return false;
@@ -636,13 +757,12 @@ static bool rebuild_deflate(uint8_t mode, uint8_t level, uint8_t strategy,
         }
         deflate_out.resize(dlen);
     } else {
-        // mode stored: payload IS the deflate stream
         deflate_out = std::move(payload);
     }
     return true;
 }
 
-/* ─── decompress PPG → PNG/APNG ─────────────────────────────────────────── */
+/* ─── FrameMeta (decompressor) ───────────────────────────────────────────── */
 
 struct FrameMeta {
     std::vector<uint8_t> fctl;
@@ -652,6 +772,9 @@ struct FrameMeta {
     uint8_t  wbits = 15, memlevel = 8;
     std::vector<uint32_t> chunk_szs;
     std::vector<uint8_t>  payload;
+    // v4 filter separation
+    bool     filter_sep = false;
+    uint32_t stride = 0, n_scanlines = 0;
 };
 
 static bool read_frame_v2(const uint8_t* p, size_t sz, size_t& pos, FrameMeta& fm) {
@@ -667,19 +790,17 @@ static bool read_frame_v2(const uint8_t* p, size_t sz, size_t& pos, FrameMeta& f
         if (pos + 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (first_seq)"); return false; }
         fm.first_seq = rd_le32(p + pos); pos += 4;
     }
-    if (pos + 5 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (mode/lv/st/wb/ml)"); return false; }
+    if (pos + 5 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (params)"); return false; }
     fm.mode     = p[pos++];
     fm.level    = p[pos++];
     fm.strategy = p[pos++];
     fm.wbits    = p[pos++];
     fm.memlevel = p[pos++];
-
     if (pos + 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (n_chunks)"); return false; }
     uint32_t nc = rd_le32(p + pos); pos += 4;
     if (pos + nc * 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (chunk_szs)"); return false; }
     fm.chunk_szs.resize(nc);
     for (uint32_t i = 0; i < nc; i++) { fm.chunk_szs[i] = rd_le32(p + pos); pos += 4; }
-
     if (pos + 16 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (sizes)"); return false; }
     uint64_t raw_sz  = rd_le64(p + pos); pos += 8;
     uint64_t lzma_sz = rd_le64(p + pos); pos += 8;
@@ -689,8 +810,70 @@ static bool read_frame_v2(const uint8_t* p, size_t sz, size_t& pos, FrameMeta& f
     return true;
 }
 
+// Read per-frame metadata for solid-format (v3/v4); no payload here.
+// Returns payload_sz via out param.
+static bool read_frame_solid_meta(const uint8_t* p, size_t sz, size_t& pos,
+                                  FrameMeta& fm, uint64_t& payload_sz,
+                                  bool is_v4)
+{
+    if (pos >= sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (frame meta)"); return false; }
+    bool has_fctl = p[pos++] != 0;
+    if (has_fctl) {
+        if (pos + 26 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (fctl)"); return false; }
+        fm.fctl.assign(p + pos, p + pos + 26); pos += 26;
+    }
+    if (pos >= sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (uses_idat)"); return false; }
+    fm.uses_idat = p[pos++] != 0;
+    if (!fm.uses_idat) {
+        if (pos + 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (first_seq)"); return false; }
+        fm.first_seq = rd_le32(p + pos); pos += 4;
+    }
+    if (pos + 5 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (params)"); return false; }
+    fm.mode     = p[pos++];
+    fm.level    = p[pos++];
+    fm.strategy = p[pos++];
+    fm.wbits    = p[pos++];
+    fm.memlevel = p[pos++];
+    if (pos + 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (n_chunks)"); return false; }
+    uint32_t nc = rd_le32(p + pos); pos += 4;
+    if (pos + nc * 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (chunk_szs)"); return false; }
+    fm.chunk_szs.resize(nc);
+    for (uint32_t i = 0; i < nc; i++) { fm.chunk_szs[i] = rd_le32(p + pos); pos += 4; }
+    if (pos + 8 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (payload_sz)"); return false; }
+    payload_sz = rd_le64(p + pos); pos += 8;
+
+    if (is_v4) {
+        if (pos >= sz) { snprintf(errormessage, MSG_SIZE, "PPG v4 truncated (fsep)"); return false; }
+        fm.filter_sep = p[pos++] != 0;
+        if (fm.filter_sep) {
+            if (pos + 8 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v4 truncated (stride/n_sc)"); return false; }
+            fm.stride      = rd_le32(p + pos); pos += 4;
+            fm.n_scanlines = rd_le32(p + pos); pos += 4;
+        }
+    }
+    return true;
+}
+
 static bool emit_idat_or_fdat(std::vector<uint8_t>& png_out, const FrameMeta& fm) {
     std::vector<uint8_t> payload_copy = fm.payload;
+
+    // Undo filter separation if applied
+    if (fm.filter_sep && fm.stride > 0 && fm.n_scanlines > 0) {
+        size_t filter_sz = fm.n_scanlines;
+        size_t pixel_sz  = (size_t)fm.n_scanlines * fm.stride;
+        if (payload_copy.size() != filter_sz + pixel_sz) {
+            snprintf(errormessage, MSG_SIZE, "filter sep size mismatch"); return false;
+        }
+        std::vector<uint8_t> reconstructed;
+        if (!unsep_filters(payload_copy.data(), fm.n_scanlines,
+                           payload_copy.data() + filter_sz, fm.stride,
+                           reconstructed))
+        {
+            snprintf(errormessage, MSG_SIZE, "unsep_filters failed"); return false;
+        }
+        payload_copy = std::move(reconstructed);
+    }
+
     std::vector<uint8_t> deflate_stream;
     if (!rebuild_deflate(fm.mode, fm.level, fm.strategy, fm.wbits, fm.memlevel,
                          payload_copy, deflate_stream))
@@ -727,6 +910,65 @@ static bool emit_idat_or_fdat(std::vector<uint8_t>& png_out, const FrameMeta& fm
     return true;
 }
 
+/* ─── solid-format decompressor (v3 + v4) ───────────────────────────────── */
+
+static bool decompress_solid(const uint8_t* p, size_t sz, size_t pos,
+                              bool is_v4, std::vector<uint8_t>& png_out)
+{
+    if (pos + 1 + 4 + 8 > sz) { snprintf(errormessage, MSG_SIZE, "PPG solid truncated (hdr)"); return false; }
+    bool     is_apng   = (p[pos++] & 1) != 0;
+    uint32_t num_plays = rd_le32(p + pos); pos += 4; (void)num_plays;
+    uint64_t pre_sz    = rd_le64(p + pos); pos += 8;
+    if (pos + pre_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG solid truncated (pre)"); return false; }
+    std::vector<uint8_t> pre(p + pos, p + pos + pre_sz); pos += pre_sz;
+    uint64_t post_sz = rd_le64(p + pos); pos += 8;
+    if (pos + post_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG solid truncated (post)"); return false; }
+    std::vector<uint8_t> post(p + pos, p + pos + post_sz); pos += post_sz;
+    uint32_t num_frames = rd_le32(p + pos); pos += 4;
+    (void)is_apng;
+
+    std::vector<FrameMeta> frames(num_frames);
+    std::vector<uint64_t>  payload_szs(num_frames);
+    for (uint32_t i = 0; i < num_frames; i++)
+        if (!read_frame_solid_meta(p, sz, pos, frames[i], payload_szs[i], is_v4))
+            return false;
+
+    if (pos + 16 > sz) { snprintf(errormessage, MSG_SIZE, "PPG solid truncated (lzma hdr)"); return false; }
+    uint64_t total_raw = rd_le64(p + pos); pos += 8;
+    uint64_t lzma_sz   = rd_le64(p + pos); pos += 8;
+    if (pos + lzma_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG solid truncated (lzma data)"); return false; }
+    std::vector<uint8_t> combined;
+    if (!lzma_dec(p + pos, lzma_sz, combined, total_raw)) return false;
+
+    size_t offset = 0;
+    for (uint32_t i = 0; i < num_frames; i++) {
+        size_t psz = (size_t)payload_szs[i];
+        if (offset + psz > combined.size()) {
+            snprintf(errormessage, MSG_SIZE, "PPG solid payload split error frame %u", i); return false;
+        }
+        frames[i].payload.assign(combined.begin() + offset, combined.begin() + offset + psz);
+        offset += psz;
+    }
+
+    png_out.clear();
+    wr_bytes(png_out, PNG_SIG, 8);
+    wr_bytes(png_out, pre.data(), pre.size());
+    for (auto& fm : frames) {
+        if (!fm.fctl.empty()) {
+            uint32_t crc = chunk_crc((const uint8_t*)"fcTL", fm.fctl.data(), fm.fctl.size());
+            wr_be32(png_out, (uint32_t)fm.fctl.size());
+            wr_bytes(png_out, (const uint8_t*)"fcTL", 4);
+            wr_bytes(png_out, fm.fctl.data(), fm.fctl.size());
+            wr_be32(png_out, crc);
+        }
+        if (!emit_idat_or_fdat(png_out, fm)) return false;
+    }
+    wr_bytes(png_out, post.data(), post.size());
+    return true;
+}
+
+/* ─── decompress PPG → PNG/APNG ─────────────────────────────────────────── */
+
 static bool decompress_ppg(const std::vector<uint8_t>& ppg_buf,
                             std::vector<uint8_t>& png_out)
 {
@@ -740,7 +982,6 @@ static bool decompress_ppg(const std::vector<uint8_t>& ppg_buf,
     uint8_t version = p[pos++];
 
     if (version == 1) {
-        // Legacy PPG v1 (single-frame PNG only)
         if (pos >= sz) { snprintf(errormessage, MSG_SIZE, "PPG v1 truncated"); return false; }
         uint8_t mode     = p[pos++];
         uint8_t level    = p[pos++];
@@ -776,10 +1017,9 @@ static bool decompress_ppg(const std::vector<uint8_t>& ppg_buf,
     }
 
     if (version == 2) {
-        // PPG v2: per-frame LZMA
         if (pos + 1 + 4 + 8 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v2 truncated (hdr)"); return false; }
         bool     is_apng   = (p[pos++] & 1) != 0;
-        uint32_t num_plays = rd_le32(p + pos); pos += 4;  (void)num_plays;
+        uint32_t num_plays = rd_le32(p + pos); pos += 4; (void)num_plays;
         uint64_t pre_sz    = rd_le64(p + pos); pos += 8;
         if (pos + pre_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG v2 truncated (pre)"); return false; }
         std::vector<uint8_t> pre(p + pos, p + pos + pre_sz); pos += pre_sz;
@@ -810,89 +1050,8 @@ static bool decompress_ppg(const std::vector<uint8_t>& ppg_buf,
         return true;
     }
 
-    if (version == 3) {
-        // PPG v3: solid LZMA (all frames in one block)
-        if (pos + 1 + 4 + 8 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (hdr)"); return false; }
-        bool     is_apng   = (p[pos++] & 1) != 0;
-        uint32_t num_plays = rd_le32(p + pos); pos += 4; (void)num_plays;
-        uint64_t pre_sz    = rd_le64(p + pos); pos += 8;
-        if (pos + pre_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (pre)"); return false; }
-        std::vector<uint8_t> pre(p + pos, p + pos + pre_sz); pos += pre_sz;
-        uint64_t post_sz = rd_le64(p + pos); pos += 8;
-        if (pos + post_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (post)"); return false; }
-        std::vector<uint8_t> post(p + pos, p + pos + post_sz); pos += post_sz;
-        uint32_t num_frames = rd_le32(p + pos); pos += 4;
-        (void)is_apng;
-
-        // Read per-frame metadata (no payload yet)
-        std::vector<FrameMeta> frames(num_frames);
-        std::vector<uint64_t>  payload_szs(num_frames);
-        for (uint32_t i = 0; i < num_frames; i++) {
-            auto& fm = frames[i];
-            if (pos >= sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (frame %u)", i); return false; }
-            bool has_fctl = p[pos++] != 0;
-            if (has_fctl) {
-                if (pos + 26 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (fctl %u)", i); return false; }
-                fm.fctl.assign(p + pos, p + pos + 26); pos += 26;
-            }
-            if (pos >= sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (uses_idat %u)", i); return false; }
-            fm.uses_idat = p[pos++] != 0;
-            if (!fm.uses_idat) {
-                if (pos + 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (first_seq %u)", i); return false; }
-                fm.first_seq = rd_le32(p + pos); pos += 4;
-            }
-            if (pos + 5 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (params %u)", i); return false; }
-            fm.mode     = p[pos++];
-            fm.level    = p[pos++];
-            fm.strategy = p[pos++];
-            fm.wbits    = p[pos++];
-            fm.memlevel = p[pos++];
-            if (pos + 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (n_chunks %u)", i); return false; }
-            uint32_t nc = rd_le32(p + pos); pos += 4;
-            if (pos + nc * 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (chunk_szs %u)", i); return false; }
-            fm.chunk_szs.resize(nc);
-            for (uint32_t j = 0; j < nc; j++) { fm.chunk_szs[j] = rd_le32(p + pos); pos += 4; }
-            if (pos + 8 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (payload_sz %u)", i); return false; }
-            payload_szs[i] = rd_le64(p + pos); pos += 8;
-        }
-
-        // Read solid LZMA block
-        if (pos + 16 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (lzma hdr)"); return false; }
-        uint64_t total_raw = rd_le64(p + pos); pos += 8;
-        uint64_t lzma_sz   = rd_le64(p + pos); pos += 8;
-        if (pos + lzma_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (lzma data)"); return false; }
-        std::vector<uint8_t> combined;
-        if (!lzma_dec(p + pos, lzma_sz, combined, total_raw)) return false;
-        pos += lzma_sz;
-
-        // Split combined into per-frame payloads
-        size_t offset = 0;
-        for (uint32_t i = 0; i < num_frames; i++) {
-            size_t psz = (size_t)payload_szs[i];
-            if (offset + psz > combined.size()) {
-                snprintf(errormessage, MSG_SIZE, "PPG v3 payload split error frame %u", i); return false;
-            }
-            frames[i].payload.assign(combined.begin() + offset, combined.begin() + offset + psz);
-            offset += psz;
-        }
-
-        // Reconstruct PNG
-        png_out.clear();
-        wr_bytes(png_out, PNG_SIG, 8);
-        wr_bytes(png_out, pre.data(), pre.size());
-        for (auto& fm : frames) {
-            if (!fm.fctl.empty()) {
-                uint32_t crc = chunk_crc((const uint8_t*)"fcTL", fm.fctl.data(), fm.fctl.size());
-                wr_be32(png_out, (uint32_t)fm.fctl.size());
-                wr_bytes(png_out, (const uint8_t*)"fcTL", 4);
-                wr_bytes(png_out, fm.fctl.data(), fm.fctl.size());
-                wr_be32(png_out, crc);
-            }
-            if (!emit_idat_or_fdat(png_out, fm)) return false;
-        }
-        wr_bytes(png_out, post.data(), post.size());
-        return true;
-    }
+    if (version == 3) return decompress_solid(p, sz, pos, false, png_out);
+    if (version == 4) return decompress_solid(p, sz, pos, true,  png_out);
 
     snprintf(errormessage, MSG_SIZE, "unknown PPG version %u", version); return false;
 }
@@ -1081,14 +1240,9 @@ static void list_ppg(const std::string& path) {
         uint64_t pre_sz=rd_le64(buf.data()+pos); pos+=8; pos+=pre_sz;
         uint64_t post_sz=rd_le64(buf.data()+pos); pos+=8; pos+=post_sz;
         uint32_t nf   = rd_le32(buf.data()+pos); pos+=4;
-
-        if (is_apng)
-            fprintf(stdout, "  PPG v2  APNG  %u frame(s)  loops=%u  pre=%lluB  post=%lluB\n",
-                    nf, plays, (unsigned long long)pre_sz, (unsigned long long)post_sz);
-        else
-            fprintf(stdout, "  PPG v2  PNG   %u frame(s)  pre=%lluB  post=%lluB\n",
-                    nf, (unsigned long long)pre_sz, (unsigned long long)post_sz);
-
+        fprintf(stdout, "  PPG v2  %s  %u frame(s)%s\n",
+                is_apng?"APNG":"PNG", nf,
+                is_apng ? (" loops=" + std::to_string(plays)).c_str() : "");
         for (uint32_t i = 0; i < nf && pos < buf.size(); i++) {
             bool has_fctl = buf[pos++] != 0;
             if (has_fctl && pos+26 <= buf.size()) pos+=26;
@@ -1098,42 +1252,32 @@ static void list_ppg(const std::string& path) {
             uint8_t mode=buf[pos++], lv=buf[pos++], st=buf[pos++];
             uint8_t wb=buf[pos++], ml=buf[pos++];
             if (pos+4 > buf.size()) break;
-            uint32_t nc=rd_le32(buf.data()+pos); pos+=4;
-            pos+=nc*4;
+            uint32_t nc=rd_le32(buf.data()+pos); pos+=4; pos+=nc*4;
             if (pos+16 > buf.size()) break;
             uint64_t raw_sz =rd_le64(buf.data()+pos); pos+=8;
-            uint64_t lzma_sz=rd_le64(buf.data()+pos); pos+=8;
-            pos+=lzma_sz;
-
-            const char* modestr = (mode==0) ? "match " : "stored";
-            const char* mcol    = (mode==0) ? col(GR)  : col(YL);
-            fprintf(stdout,
-                    "  Frame %u: %s[%s]%s %s  lv=%u st=%-8s wb=%u ml=%u"
+            uint64_t lzma_sz=rd_le64(buf.data()+pos); pos+=8; pos+=lzma_sz;
+            const char* mcol = (mode==0) ? col(GR) : col(YL);
+            fprintf(stdout, "  Frame %u: %s[%s]%s %s  lv=%u st=%-8s wb=%u ml=%u"
                     "  raw=%llu  lzma=%llu (%.1f%%)\n",
-                    i, mcol, modestr, col(R),
-                    uses_idat ? "IDAT" : "fdAT",
-                    lv, strategy_name(st), wb, ml,
+                    i, mcol, mode==0?"match ":"stored", col(R),
+                    uses_idat?"IDAT":"fdAT", lv, strategy_name(st), wb, ml,
                     (unsigned long long)raw_sz, (unsigned long long)lzma_sz,
                     raw_sz > 0 ? 100.0*lzma_sz/raw_sz : 0.0);
         }
         return;
     }
 
-    if (version == 3) {
+    if (version == 3 || version == 4) {
         bool is_apng   = (buf[pos++] & 1) != 0;
         uint32_t plays = rd_le32(buf.data()+pos); pos+=4;
         uint64_t pre_sz=rd_le64(buf.data()+pos); pos+=8; pos+=pre_sz;
         uint64_t post_sz=rd_le64(buf.data()+pos); pos+=8; pos+=post_sz;
         uint32_t nf   = rd_le32(buf.data()+pos); pos+=4;
+        fprintf(stdout, "  PPG v%u  %s  %u frame(s)%s  [solid LZMA%s]\n",
+                version, is_apng?"APNG":"PNG", nf,
+                is_apng ? (" loops=" + std::to_string(plays)).c_str() : "",
+                version==4 ? " + filter sep" : "");
 
-        if (is_apng)
-            fprintf(stdout, "  PPG v3  APNG  %u frame(s)  loops=%u  pre=%lluB  post=%lluB  [solid LZMA]\n",
-                    nf, plays, (unsigned long long)pre_sz, (unsigned long long)post_sz);
-        else
-            fprintf(stdout, "  PPG v3  PNG   %u frame(s)  pre=%lluB  post=%lluB  [solid LZMA]\n",
-                    nf, (unsigned long long)pre_sz, (unsigned long long)post_sz);
-
-        uint64_t total_raw_acc = 0;
         for (uint32_t i = 0; i < nf && pos < buf.size(); i++) {
             bool has_fctl = buf[pos++] != 0;
             if (has_fctl && pos+26 <= buf.size()) pos+=26;
@@ -1143,27 +1287,31 @@ static void list_ppg(const std::string& path) {
             uint8_t mode=buf[pos++], lv=buf[pos++], st=buf[pos++];
             uint8_t wb=buf[pos++], ml=buf[pos++];
             if (pos+4 > buf.size()) break;
-            uint32_t nc=rd_le32(buf.data()+pos); pos+=4;
-            pos+=nc*4;
+            uint32_t nc=rd_le32(buf.data()+pos); pos+=4; pos+=nc*4;
             if (pos+8 > buf.size()) break;
             uint64_t psz=rd_le64(buf.data()+pos); pos+=8;
-            total_raw_acc += psz;
-
-            const char* modestr = (mode==0) ? "match " : "stored";
-            const char* mcol    = (mode==0) ? col(GR)  : col(YL);
-            fprintf(stdout,
-                    "  Frame %u: %s[%s]%s %s  lv=%u st=%-8s wb=%u ml=%u  payload=%llu\n",
-                    i, mcol, modestr, col(R),
-                    uses_idat ? "IDAT" : "fdAT",
-                    lv, strategy_name(st), wb, ml,
-                    (unsigned long long)psz);
+            bool fsep = false; uint32_t stride=0, nsc=0;
+            if (version == 4 && pos < buf.size()) {
+                fsep = buf[pos++] != 0;
+                if (fsep && pos+8 <= buf.size()) {
+                    stride = rd_le32(buf.data()+pos); pos+=4;
+                    nsc    = rd_le32(buf.data()+pos); pos+=4;
+                }
+            }
+            const char* mcol = (mode==0) ? col(GR) : col(YL);
+            fprintf(stdout, "  Frame %u: %s[%s]%s %s  lv=%u st=%-8s wb=%u ml=%u"
+                    "  payload=%llu%s\n",
+                    i, mcol, mode==0?"match ":"stored", col(R),
+                    uses_idat?"IDAT":"fdAT", lv, strategy_name(st), wb, ml,
+                    (unsigned long long)psz,
+                    fsep ? (" [fsep stride=" + std::to_string(stride) +
+                             " rows=" + std::to_string(nsc) + "]").c_str() : "");
         }
         if (pos+16 <= buf.size()) {
-            uint64_t total_raw =rd_le64(buf.data()+pos); pos+=8;
-            uint64_t lzma_sz   =rd_le64(buf.data()+pos);
+            uint64_t total_raw=rd_le64(buf.data()+pos); pos+=8;
+            uint64_t lzma_sz  =rd_le64(buf.data()+pos);
             fprintf(stdout, "  Solid LZMA: %llu → %llu (%.1f%%)\n",
-                    (unsigned long long)total_raw,
-                    (unsigned long long)lzma_sz,
+                    (unsigned long long)total_raw, (unsigned long long)lzma_sz,
                     total_raw > 0 ? 100.0*lzma_sz/total_raw : 0.0);
         }
         return;
