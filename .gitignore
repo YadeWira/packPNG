@@ -1,0 +1,5 @@
+source/packPNG
+source/packPNG_asan
+source/packPNG.exe
+*.o
+*.ppg
