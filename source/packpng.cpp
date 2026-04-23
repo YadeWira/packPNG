@@ -1,14 +1,14 @@
-/* packPNG v0.2 - PNG/APNG lossless recompressor
+/* packPNG v0.3 - PNG/APNG lossless recompressor
  *
  * Per-frame algorithm:
  *   PNG/APNG → parse frames → inflate pixels → brute-force zlib re-encode
- *   → LZMA → .ppg   (mode 0 = match)
- *   If no match: store original deflate stream → LZMA → .ppg  (mode 1 = stored)
+ *   → solid LZMA (all frames in one block) → .ppg   (mode 0 = match)
+ *   If no match: store original deflate stream → solid LZMA → .ppg  (mode 1 = stored)
  *
+ * PPG format v3: solid LZMA across all frames; v1/v2 files still decompressable.
  * CLI mirrors packJPG v4.x.
  * Targets: Linux x86-64, Windows 10/11 x86-64.
  * Deps: zlib, liblzma.
- * PPG format v2: multi-frame APNG; v1 files still decompressable.
  */
 
 #include <algorithm>
@@ -35,9 +35,9 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "d";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "";   // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   appversion = 2;   // v0.2d
+static const int   appversion = 3;   // v0.3
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
 
@@ -58,6 +58,7 @@ static bool decompress_only = false;
 static bool wait_exit       = true;
 static bool no_color        = false;
 static bool sfth            = false;  // parallel brute-force within one file
+static bool lzma_extreme    = false;  // LZMA_PRESET_EXTREME flag
 static int  verbosity       = 0;
 static int  num_threads     = 1;      // file-level threads (-th)
 static int  sfth_threads    = 1;      // brute-force threads (-sfth, set post-parse)
@@ -323,9 +324,6 @@ static bool probe_deflate(const uint8_t* px, size_t pxsz,
                           std::vector<uint8_t>& tmp)
 {
     // Phase 1 – quick pre-filter: produce 256 bytes of output.
-    // Wrong candidates typically diverge within the first few bytes of compressed
-    // data (right after the 2-byte header). This avoids the full PROBE_BYTES
-    // deflation for candidates that can be ruled out cheaply.
     {
         static const size_t QUICK = 256;
         z_stream q{};
@@ -344,8 +342,6 @@ static bool probe_deflate(const uint8_t* px, size_t pxsz,
         }
     }
     // Phase 2 – full probe: produce PROBE_BYTES of output.
-    // Z_FINISH on the full input; zlib stops when the buffer fills, so the bytes
-    // written are the exact prefix of the complete compressed stream.
     z_stream zs{};
     if (deflateInit2(&zs, lv, Z_DEFLATED, wbits, memlevel, st) != Z_OK) return false;
     tmp.resize(PROBE_BYTES + 128);
@@ -387,14 +383,11 @@ static std::vector<Candidate> build_candidates(const std::vector<uint8_t>& targe
     if (target.size() < 2) return {};
 
     // CMF byte (target[0]): bits 4-7 = CINFO, wbits = CINFO + 8.
-    // Most encoders use wbits=15 (CINFO=7, CMF high nibble=7 → e.g. 0x78).
-    // Android/mobile often use wbits=14 (CMF=0x68) or 13 (CMF=0x58).
     int cinfo = (target[0] >> 4) & 0xF;
     int wbits  = std::max(8, std::min(15, cinfo + 8));
 
     uint8_t flevel = (target[1] >> 6) & 3;
     int lv_min, lv_max;
-    // zlib level→FLEVEL: 1→0, 2-5→1, 6→2, 7-9→3
     switch (flevel) {
         case 0: lv_min=1; lv_max=1; break;
         case 1: lv_min=2; lv_max=5; break;
@@ -412,7 +405,7 @@ static std::vector<Candidate> build_candidates(const std::vector<uint8_t>& targe
             if (!(lv == 6 && st == Z_FILTERED))
                 c.push_back({lv, st, wbits, 8});
 
-    // Extended: memlevel=9 (some encoders; probe rejects quickly if wrong)
+    // Extended: memlevel=9
     if (lv_min <= 6 && 6 <= lv_max) c.push_back({6, Z_FILTERED, wbits, 9});
     for (int lv = lv_min; lv <= lv_max; lv++)
         for (int st : strats)
@@ -430,7 +423,6 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
     if (cands.empty()) return false;
 
     if (sfth_threads <= 1) {
-        // Sequential
         std::vector<uint8_t> tmp, attempt;
         for (auto& c : cands) {
             if (!probe_deflate(px.data(), px.size(), tgt.data(), tgt.size(),
@@ -475,11 +467,13 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
 /* ─── LZMA compress / decompress ─────────────────────────────────────────── */
 
 static bool lzma_enc(const uint8_t* in, size_t insz, std::vector<uint8_t>& out) {
+    uint32_t preset = g_lzma_preset;
+    if (lzma_extreme) preset |= LZMA_PRESET_EXTREME;
     size_t bound = lzma_stream_buffer_bound(insz);
     out.resize(bound);
     size_t pos = 0;
     lzma_ret r = lzma_easy_buffer_encode(
-        g_lzma_preset, LZMA_CHECK_CRC64, nullptr,
+        preset, LZMA_CHECK_CRC64, nullptr,
         in, insz, out.data(), &pos, bound);
     if (r != LZMA_OK) {
         snprintf(errormessage, MSG_SIZE, "LZMA encode failed: %d", (int)r); return false;
@@ -505,59 +499,13 @@ static bool lzma_dec(const uint8_t* in, size_t insz,
     return true;
 }
 
-/* ─── PPG write helpers ──────────────────────────────────────────────────── */
+/* ─── compress PNG/APNG → PPG v3 (solid LZMA) ───────────────────────────── */
 
-// Compress one frame and append its serialised data to ppg_out.
-// Returns false on error (errormessage set).
-static bool write_frame(const PngFrame& fr, std::vector<uint8_t>& ppg_out) {
-    DeflParams dp{};
-    bool matched = !fr.pixels.empty() &&
-                   find_deflate_params(fr.pixels, fr.idat_raw, dp);
-
-    const uint8_t* payload = matched ? fr.pixels.data()   : fr.idat_raw.data();
-    size_t         paysz   = matched ? fr.pixels.size()    : fr.idat_raw.size();
-
-    std::vector<uint8_t> lzma_data;
-    if (!lzma_enc(payload, paysz, lzma_data)) return false;
-
-    if (verbosity >= 1) {
-        std::lock_guard<std::mutex> lk(g_print_mutex);
-        if (matched)
-            fprintf(stdout, "  %s[match]%s  lv=%d st=%s wb=%d ml=%d  px=%zu  idat=%zu  →lzma=%zu\n",
-                    col(GR), col(R), dp.level, strategy_name(dp.strategy),
-                    dp.wbits, dp.memlevel,
-                    fr.pixels.size(), fr.idat_raw.size(), lzma_data.size());
-        else
-            fprintf(stdout, "  %s[stored]%s  idat=%zu  →lzma=%zu\n",
-                    col(YL), col(R), fr.idat_raw.size(), lzma_data.size());
-    }
-
-    // Frame header
-    ppg_out.push_back(fr.fctl.empty() ? 0 : 1);
-    if (!fr.fctl.empty()) {
-        if (fr.fctl.size() != 26) {
-            snprintf(errormessage, MSG_SIZE, "bad fctl size"); return false;
-        }
-        wr_bytes(ppg_out, fr.fctl.data(), 26);
-    }
-    ppg_out.push_back(fr.uses_idat ? 1 : 0);
-    if (!fr.uses_idat) wr_le32(ppg_out, fr.first_seq);
-    ppg_out.push_back(matched ? 0 : 1);                         // mode
-    ppg_out.push_back(matched ? (uint8_t)dp.level    : 0);     // level
-    ppg_out.push_back(matched ? (uint8_t)dp.strategy : 0);     // strategy
-    ppg_out.push_back(matched ? (uint8_t)dp.wbits    : 15);    // wbits (CMF-derived)
-    ppg_out.push_back(matched ? (uint8_t)dp.memlevel : 8);     // memlevel
-
-    wr_le32(ppg_out, (uint32_t)fr.chunk_szs.size());
-    for (uint32_t s : fr.chunk_szs) wr_le32(ppg_out, s);
-
-    wr_le64(ppg_out, (uint64_t)paysz);
-    wr_le64(ppg_out, (uint64_t)lzma_data.size());
-    wr_bytes(ppg_out, lzma_data.data(), lzma_data.size());
-    return true;
-}
-
-/* ─── compress PNG/APNG → PPG ────────────────────────────────────────────── */
+struct FrameEnc {
+    bool       matched;
+    DeflParams dp;
+    size_t     payload_sz;  // pixels.size() when matched, idat_raw.size() otherwise
+};
 
 static bool compress_png(const std::vector<uint8_t>& png_buf,
                          std::vector<uint8_t>& ppg_out)
@@ -565,19 +513,91 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
     PngInfo info;
     if (!parse_png(png_buf, info)) return false;
 
+    // Phase 1: find deflate params for each frame
+    std::vector<FrameEnc> enc;
+    enc.reserve(info.frames.size());
+    size_t total_payload = 0;
+
+    for (auto& fr : info.frames) {
+        FrameEnc fe;
+        fe.matched = !fr.pixels.empty() &&
+                     find_deflate_params(fr.pixels, fr.idat_raw, fe.dp);
+        fe.payload_sz = fe.matched ? fr.pixels.size() : fr.idat_raw.size();
+        total_payload += fe.payload_sz;
+
+        if (verbosity >= 1) {
+            std::lock_guard<std::mutex> lk(g_print_mutex);
+            if (fe.matched)
+                fprintf(stdout,
+                    "  %s[match]%s  lv=%d st=%s wb=%d ml=%d  px=%zu  idat=%zu\n",
+                    col(GR), col(R), fe.dp.level, strategy_name(fe.dp.strategy),
+                    fe.dp.wbits, fe.dp.memlevel,
+                    fr.pixels.size(), fr.idat_raw.size());
+            else
+                fprintf(stdout, "  %s[stored]%s  idat=%zu\n",
+                    col(YL), col(R), fr.idat_raw.size());
+        }
+        enc.push_back(fe);
+    }
+
+    // Phase 2: concatenate all payloads → one solid LZMA block
+    std::vector<uint8_t> combined;
+    combined.reserve(total_payload);
+    for (size_t i = 0; i < info.frames.size(); i++) {
+        auto& fr = info.frames[i];
+        auto& fe = enc[i];
+        const uint8_t* p = fe.matched ? fr.pixels.data() : fr.idat_raw.data();
+        combined.insert(combined.end(), p, p + fe.payload_sz);
+    }
+
+    std::vector<uint8_t> lzma_data;
+    if (!lzma_enc(combined.data(), combined.size(), lzma_data)) return false;
+
+    if (verbosity >= 1) {
+        std::lock_guard<std::mutex> lk(g_print_mutex);
+        fprintf(stdout, "  solid LZMA: %zu → %zu (%.1f%%)\n",
+                total_payload, lzma_data.size(),
+                total_payload > 0 ? 100.0 * lzma_data.size() / total_payload : 0.0);
+    }
+
+    // Phase 3: write PPG v3
     ppg_out.clear();
     wr_bytes(ppg_out, PPG_SIG, 4);
-    ppg_out.push_back(2);                               // format version
+    ppg_out.push_back(3);                               // format version
     ppg_out.push_back(info.is_apng ? 1 : 0);           // flags
     wr_le32(ppg_out, info.num_plays);
     wr_le64(ppg_out, (uint64_t)info.pre.size());
     wr_bytes(ppg_out, info.pre.data(), info.pre.size());
     wr_le64(ppg_out, (uint64_t)info.post.size());
     wr_bytes(ppg_out, info.post.data(), info.post.size());
-    wr_le32(ppg_out, (uint32_t)info.frames.size());
+    wr_le32(ppg_out, (uint32_t)enc.size());
 
-    for (auto& fr : info.frames)
-        if (!write_frame(fr, ppg_out)) return false;
+    for (size_t i = 0; i < enc.size(); i++) {
+        auto& fr = info.frames[i];
+        auto& fe = enc[i];
+        ppg_out.push_back(fr.fctl.empty() ? 0 : 1);
+        if (!fr.fctl.empty()) {
+            if (fr.fctl.size() != 26) {
+                snprintf(errormessage, MSG_SIZE, "bad fctl size"); return false;
+            }
+            wr_bytes(ppg_out, fr.fctl.data(), 26);
+        }
+        ppg_out.push_back(fr.uses_idat ? 1 : 0);
+        if (!fr.uses_idat) wr_le32(ppg_out, fr.first_seq);
+        ppg_out.push_back(fe.matched ? 0 : 1);
+        ppg_out.push_back(fe.matched ? (uint8_t)fe.dp.level    : 0);
+        ppg_out.push_back(fe.matched ? (uint8_t)fe.dp.strategy : 0);
+        ppg_out.push_back(fe.matched ? (uint8_t)fe.dp.wbits    : 15);
+        ppg_out.push_back(fe.matched ? (uint8_t)fe.dp.memlevel : 8);
+        wr_le32(ppg_out, (uint32_t)fr.chunk_szs.size());
+        for (uint32_t s : fr.chunk_szs) wr_le32(ppg_out, s);
+        wr_le64(ppg_out, (uint64_t)fe.payload_sz);  // size of this frame in solid block
+    }
+
+    // Solid LZMA block
+    wr_le64(ppg_out, (uint64_t)total_payload);
+    wr_le64(ppg_out, (uint64_t)lzma_data.size());
+    wr_bytes(ppg_out, lzma_data.data(), lzma_data.size());
 
     return true;
 }
@@ -616,7 +636,6 @@ static bool rebuild_deflate(uint8_t mode, uint8_t level, uint8_t strategy,
 
 /* ─── decompress PPG → PNG/APNG ─────────────────────────────────────────── */
 
-// Read one frame from ppg data starting at pos; advance pos.
 struct FrameMeta {
     std::vector<uint8_t> fctl;
     bool     uses_idat;
@@ -685,7 +704,6 @@ static bool emit_idat_or_fdat(std::vector<uint8_t>& png_out, const FrameMeta& fm
         } else {
             uint32_t seq = fm.first_seq + (uint32_t)i;
             uint32_t total = csz + 4;
-            // Build fdAT data: seq(4) + payload
             std::vector<uint8_t> fdat_data(total);
             fdat_data[0] = (seq>>24)&0xFF; fdat_data[1] = (seq>>16)&0xFF;
             fdat_data[2] = (seq>>8)&0xFF;  fdat_data[3] = seq&0xFF;
@@ -749,43 +767,126 @@ static bool decompress_ppg(const std::vector<uint8_t>& ppg_buf,
         return true;
     }
 
-    if (version != 2) {
-        snprintf(errormessage, MSG_SIZE, "unknown PPG version %u", version); return false;
-    }
+    if (version == 2) {
+        // PPG v2: per-frame LZMA
+        if (pos + 1 + 4 + 8 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v2 truncated (hdr)"); return false; }
+        bool     is_apng   = (p[pos++] & 1) != 0;
+        uint32_t num_plays = rd_le32(p + pos); pos += 4;  (void)num_plays;
+        uint64_t pre_sz    = rd_le64(p + pos); pos += 8;
+        if (pos + pre_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG v2 truncated (pre)"); return false; }
+        std::vector<uint8_t> pre(p + pos, p + pos + pre_sz); pos += pre_sz;
+        uint64_t post_sz = rd_le64(p + pos); pos += 8;
+        if (pos + post_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG v2 truncated (post)"); return false; }
+        std::vector<uint8_t> post(p + pos, p + pos + post_sz); pos += post_sz;
+        uint32_t num_frames = rd_le32(p + pos); pos += 4;
+        (void)is_apng;
 
-    // PPG v2
-    if (pos + 1 + 4 + 8 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v2 truncated (hdr)"); return false; }
-    bool     is_apng   = (p[pos++] & 1) != 0;
-    uint32_t num_plays = rd_le32(p + pos); pos += 4;  (void)num_plays;
-    uint64_t pre_sz    = rd_le64(p + pos); pos += 8;
-    if (pos + pre_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG v2 truncated (pre)"); return false; }
-    std::vector<uint8_t> pre(p + pos, p + pos + pre_sz); pos += pre_sz;
-    uint64_t post_sz = rd_le64(p + pos); pos += 8;
-    if (pos + post_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG v2 truncated (post)"); return false; }
-    std::vector<uint8_t> post(p + pos, p + pos + post_sz); pos += post_sz;
-    uint32_t num_frames = rd_le32(p + pos); pos += 4;
-    (void)is_apng;
+        std::vector<FrameMeta> frames(num_frames);
+        for (uint32_t i = 0; i < num_frames; i++)
+            if (!read_frame_v2(p, sz, pos, frames[i])) return false;
 
-    std::vector<FrameMeta> frames(num_frames);
-    for (uint32_t i = 0; i < num_frames; i++)
-        if (!read_frame_v2(p, sz, pos, frames[i])) return false;
-
-    png_out.clear();
-    wr_bytes(png_out, PNG_SIG, 8);
-    wr_bytes(png_out, pre.data(), pre.size());
-    for (auto& fm : frames) {
-        // Write fcTL chunk if present
-        if (!fm.fctl.empty()) {
-            uint32_t crc = chunk_crc((const uint8_t*)"fcTL", fm.fctl.data(), fm.fctl.size());
-            wr_be32(png_out, (uint32_t)fm.fctl.size());
-            wr_bytes(png_out, (const uint8_t*)"fcTL", 4);
-            wr_bytes(png_out, fm.fctl.data(), fm.fctl.size());
-            wr_be32(png_out, crc);
+        png_out.clear();
+        wr_bytes(png_out, PNG_SIG, 8);
+        wr_bytes(png_out, pre.data(), pre.size());
+        for (auto& fm : frames) {
+            if (!fm.fctl.empty()) {
+                uint32_t crc = chunk_crc((const uint8_t*)"fcTL", fm.fctl.data(), fm.fctl.size());
+                wr_be32(png_out, (uint32_t)fm.fctl.size());
+                wr_bytes(png_out, (const uint8_t*)"fcTL", 4);
+                wr_bytes(png_out, fm.fctl.data(), fm.fctl.size());
+                wr_be32(png_out, crc);
+            }
+            if (!emit_idat_or_fdat(png_out, fm)) return false;
         }
-        if (!emit_idat_or_fdat(png_out, fm)) return false;
+        wr_bytes(png_out, post.data(), post.size());
+        return true;
     }
-    wr_bytes(png_out, post.data(), post.size());
-    return true;
+
+    if (version == 3) {
+        // PPG v3: solid LZMA (all frames in one block)
+        if (pos + 1 + 4 + 8 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (hdr)"); return false; }
+        bool     is_apng   = (p[pos++] & 1) != 0;
+        uint32_t num_plays = rd_le32(p + pos); pos += 4; (void)num_plays;
+        uint64_t pre_sz    = rd_le64(p + pos); pos += 8;
+        if (pos + pre_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (pre)"); return false; }
+        std::vector<uint8_t> pre(p + pos, p + pos + pre_sz); pos += pre_sz;
+        uint64_t post_sz = rd_le64(p + pos); pos += 8;
+        if (pos + post_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (post)"); return false; }
+        std::vector<uint8_t> post(p + pos, p + pos + post_sz); pos += post_sz;
+        uint32_t num_frames = rd_le32(p + pos); pos += 4;
+        (void)is_apng;
+
+        // Read per-frame metadata (no payload yet)
+        std::vector<FrameMeta> frames(num_frames);
+        std::vector<uint64_t>  payload_szs(num_frames);
+        for (uint32_t i = 0; i < num_frames; i++) {
+            auto& fm = frames[i];
+            if (pos >= sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (frame %u)", i); return false; }
+            bool has_fctl = p[pos++] != 0;
+            if (has_fctl) {
+                if (pos + 26 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (fctl %u)", i); return false; }
+                fm.fctl.assign(p + pos, p + pos + 26); pos += 26;
+            }
+            if (pos >= sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (uses_idat %u)", i); return false; }
+            fm.uses_idat = p[pos++] != 0;
+            if (!fm.uses_idat) {
+                if (pos + 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (first_seq %u)", i); return false; }
+                fm.first_seq = rd_le32(p + pos); pos += 4;
+            }
+            if (pos + 5 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (params %u)", i); return false; }
+            fm.mode     = p[pos++];
+            fm.level    = p[pos++];
+            fm.strategy = p[pos++];
+            fm.wbits    = p[pos++];
+            fm.memlevel = p[pos++];
+            if (pos + 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (n_chunks %u)", i); return false; }
+            uint32_t nc = rd_le32(p + pos); pos += 4;
+            if (pos + nc * 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (chunk_szs %u)", i); return false; }
+            fm.chunk_szs.resize(nc);
+            for (uint32_t j = 0; j < nc; j++) { fm.chunk_szs[j] = rd_le32(p + pos); pos += 4; }
+            if (pos + 8 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (payload_sz %u)", i); return false; }
+            payload_szs[i] = rd_le64(p + pos); pos += 8;
+        }
+
+        // Read solid LZMA block
+        if (pos + 16 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (lzma hdr)"); return false; }
+        uint64_t total_raw = rd_le64(p + pos); pos += 8;
+        uint64_t lzma_sz   = rd_le64(p + pos); pos += 8;
+        if (pos + lzma_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG v3 truncated (lzma data)"); return false; }
+        std::vector<uint8_t> combined;
+        if (!lzma_dec(p + pos, lzma_sz, combined, total_raw)) return false;
+        pos += lzma_sz;
+
+        // Split combined into per-frame payloads
+        size_t offset = 0;
+        for (uint32_t i = 0; i < num_frames; i++) {
+            size_t psz = (size_t)payload_szs[i];
+            if (offset + psz > combined.size()) {
+                snprintf(errormessage, MSG_SIZE, "PPG v3 payload split error frame %u", i); return false;
+            }
+            frames[i].payload.assign(combined.begin() + offset, combined.begin() + offset + psz);
+            offset += psz;
+        }
+
+        // Reconstruct PNG
+        png_out.clear();
+        wr_bytes(png_out, PNG_SIG, 8);
+        wr_bytes(png_out, pre.data(), pre.size());
+        for (auto& fm : frames) {
+            if (!fm.fctl.empty()) {
+                uint32_t crc = chunk_crc((const uint8_t*)"fcTL", fm.fctl.data(), fm.fctl.size());
+                wr_be32(png_out, (uint32_t)fm.fctl.size());
+                wr_bytes(png_out, (const uint8_t*)"fcTL", 4);
+                wr_bytes(png_out, fm.fctl.data(), fm.fctl.size());
+                wr_be32(png_out, crc);
+            }
+            if (!emit_idat_or_fdat(png_out, fm)) return false;
+        }
+        wr_bytes(png_out, post.data(), post.size());
+        return true;
+    }
+
+    snprintf(errormessage, MSG_SIZE, "unknown PPG version %u", version); return false;
 }
 
 /* ─── file helpers ───────────────────────────────────────────────────────── */
@@ -813,7 +914,7 @@ static FileType detect_type(const std::string& path) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return F_UNK;
     uint8_t buf[8]; size_t n = fread(buf, 1, 8, f); fclose(f);
-    if (n >= 8 && memcmp(buf, PNG_SIG, 8) == 0) return F_PNG;  // also matches APNG
+    if (n >= 8 && memcmp(buf, PNG_SIG, 8) == 0) return F_PNG;
     if (n >= 4 && memcmp(buf, PPG_SIG, 4) == 0) return F_PPG;
     return F_UNK;
 }
@@ -872,7 +973,6 @@ static void process_file(const std::string& inpath) {
         std::vector<uint8_t> rt;
         bool vok;
         if (do_compress) {
-            // Verify compress: decompress the PPG we just produced → must equal original PNG
             vok = decompress_ppg(out, rt);
             if (!vok || rt != in) {
                 std::lock_guard<std::mutex> lk(g_print_mutex);
@@ -881,7 +981,6 @@ static void process_file(const std::string& inpath) {
                 return;
             }
         } else {
-            // Verify decompress: re-decompress the same PPG → must equal what we just wrote
             vok = decompress_ppg(in, rt);
             if (!vok || rt != out) {
                 std::lock_guard<std::mutex> lk(g_print_mutex);
@@ -912,7 +1011,6 @@ static void process_file(const std::string& inpath) {
         }
     }
     g_processed++;
-    // Atomic double add via CAS loop
     double prev = g_acc_in.load();
     while (!g_acc_in.compare_exchange_weak(prev, prev + (double)in_sz)) {}
     prev = g_acc_out.load();
@@ -969,50 +1067,101 @@ static void list_ppg(const std::string& path) {
         return;
     }
 
-    if (version != 2) {
-        fprintf(stdout, "  unknown PPG version %u\n", version); return;
+    if (version == 2) {
+        bool is_apng   = (buf[pos++] & 1) != 0;
+        uint32_t plays = rd_le32(buf.data()+pos); pos+=4;
+        uint64_t pre_sz=rd_le64(buf.data()+pos); pos+=8; pos+=pre_sz;
+        uint64_t post_sz=rd_le64(buf.data()+pos); pos+=8; pos+=post_sz;
+        uint32_t nf   = rd_le32(buf.data()+pos); pos+=4;
+
+        if (is_apng)
+            fprintf(stdout, "  PPG v2  APNG  %u frame(s)  loops=%u  pre=%lluB  post=%lluB\n",
+                    nf, plays, (unsigned long long)pre_sz, (unsigned long long)post_sz);
+        else
+            fprintf(stdout, "  PPG v2  PNG   %u frame(s)  pre=%lluB  post=%lluB\n",
+                    nf, (unsigned long long)pre_sz, (unsigned long long)post_sz);
+
+        for (uint32_t i = 0; i < nf && pos < buf.size(); i++) {
+            bool has_fctl = buf[pos++] != 0;
+            if (has_fctl && pos+26 <= buf.size()) pos+=26;
+            bool uses_idat = buf[pos++] != 0;
+            if (!uses_idat && pos+4 <= buf.size()) pos+=4;
+            if (pos+5 > buf.size()) break;
+            uint8_t mode=buf[pos++], lv=buf[pos++], st=buf[pos++];
+            uint8_t wb=buf[pos++], ml=buf[pos++];
+            if (pos+4 > buf.size()) break;
+            uint32_t nc=rd_le32(buf.data()+pos); pos+=4;
+            pos+=nc*4;
+            if (pos+16 > buf.size()) break;
+            uint64_t raw_sz =rd_le64(buf.data()+pos); pos+=8;
+            uint64_t lzma_sz=rd_le64(buf.data()+pos); pos+=8;
+            pos+=lzma_sz;
+
+            const char* modestr = (mode==0) ? "match " : "stored";
+            const char* mcol    = (mode==0) ? col(GR)  : col(YL);
+            fprintf(stdout,
+                    "  Frame %u: %s[%s]%s %s  lv=%u st=%-8s wb=%u ml=%u"
+                    "  raw=%llu  lzma=%llu (%.1f%%)\n",
+                    i, mcol, modestr, col(R),
+                    uses_idat ? "IDAT" : "fdAT",
+                    lv, strategy_name(st), wb, ml,
+                    (unsigned long long)raw_sz, (unsigned long long)lzma_sz,
+                    raw_sz > 0 ? 100.0*lzma_sz/raw_sz : 0.0);
+        }
+        return;
     }
 
-    bool is_apng   = (buf[pos++] & 1) != 0;
-    uint32_t plays = rd_le32(buf.data()+pos); pos+=4;
-    uint64_t pre_sz=rd_le64(buf.data()+pos); pos+=8; pos+=pre_sz;
-    uint64_t post_sz=rd_le64(buf.data()+pos); pos+=8; pos+=post_sz;
-    uint32_t nf   = rd_le32(buf.data()+pos); pos+=4;
+    if (version == 3) {
+        bool is_apng   = (buf[pos++] & 1) != 0;
+        uint32_t plays = rd_le32(buf.data()+pos); pos+=4;
+        uint64_t pre_sz=rd_le64(buf.data()+pos); pos+=8; pos+=pre_sz;
+        uint64_t post_sz=rd_le64(buf.data()+pos); pos+=8; pos+=post_sz;
+        uint32_t nf   = rd_le32(buf.data()+pos); pos+=4;
 
-    if (is_apng)
-        fprintf(stdout, "  PPG v2  APNG  %u frame(s)  loops=%u  pre=%lluB  post=%lluB\n",
-                nf, plays, (unsigned long long)pre_sz, (unsigned long long)post_sz);
-    else
-        fprintf(stdout, "  PPG v2  PNG   %u frame(s)  pre=%lluB  post=%lluB\n",
-                nf, (unsigned long long)pre_sz, (unsigned long long)post_sz);
+        if (is_apng)
+            fprintf(stdout, "  PPG v3  APNG  %u frame(s)  loops=%u  pre=%lluB  post=%lluB  [solid LZMA]\n",
+                    nf, plays, (unsigned long long)pre_sz, (unsigned long long)post_sz);
+        else
+            fprintf(stdout, "  PPG v3  PNG   %u frame(s)  pre=%lluB  post=%lluB  [solid LZMA]\n",
+                    nf, (unsigned long long)pre_sz, (unsigned long long)post_sz);
 
-    for (uint32_t i = 0; i < nf && pos < buf.size(); i++) {
-        bool has_fctl = buf[pos++] != 0;
-        if (has_fctl && pos+26 <= buf.size()) pos+=26;
-        bool uses_idat = buf[pos++] != 0;
-        if (!uses_idat && pos+4 <= buf.size()) pos+=4;
-        if (pos+5 > buf.size()) break;
-        uint8_t mode=buf[pos++], lv=buf[pos++], st=buf[pos++];
-        uint8_t wb=buf[pos++], ml=buf[pos++];
-        if (pos+4 > buf.size()) break;
-        uint32_t nc=rd_le32(buf.data()+pos); pos+=4;
-        pos+=nc*4;
-        if (pos+16 > buf.size()) break;
-        uint64_t raw_sz =rd_le64(buf.data()+pos); pos+=8;
-        uint64_t lzma_sz=rd_le64(buf.data()+pos); pos+=8;
-        pos+=lzma_sz;
+        uint64_t total_raw_acc = 0;
+        for (uint32_t i = 0; i < nf && pos < buf.size(); i++) {
+            bool has_fctl = buf[pos++] != 0;
+            if (has_fctl && pos+26 <= buf.size()) pos+=26;
+            bool uses_idat = buf[pos++] != 0;
+            if (!uses_idat && pos+4 <= buf.size()) pos+=4;
+            if (pos+5 > buf.size()) break;
+            uint8_t mode=buf[pos++], lv=buf[pos++], st=buf[pos++];
+            uint8_t wb=buf[pos++], ml=buf[pos++];
+            if (pos+4 > buf.size()) break;
+            uint32_t nc=rd_le32(buf.data()+pos); pos+=4;
+            pos+=nc*4;
+            if (pos+8 > buf.size()) break;
+            uint64_t psz=rd_le64(buf.data()+pos); pos+=8;
+            total_raw_acc += psz;
 
-        const char* modestr = (mode==0) ? "match " : "stored";
-        const char* mcol    = (mode==0) ? col(GR)  : col(YL);
-        fprintf(stdout,
-                "  Frame %u: %s[%s]%s %s  lv=%u st=%-8s wb=%u ml=%u"
-                "  raw=%llu  lzma=%llu (%.1f%%)\n",
-                i, mcol, modestr, col(R),
-                uses_idat ? "IDAT" : "fdAT",
-                lv, strategy_name(st), wb, ml,
-                (unsigned long long)raw_sz, (unsigned long long)lzma_sz,
-                raw_sz > 0 ? 100.0*lzma_sz/raw_sz : 0.0);
+            const char* modestr = (mode==0) ? "match " : "stored";
+            const char* mcol    = (mode==0) ? col(GR)  : col(YL);
+            fprintf(stdout,
+                    "  Frame %u: %s[%s]%s %s  lv=%u st=%-8s wb=%u ml=%u  payload=%llu\n",
+                    i, mcol, modestr, col(R),
+                    uses_idat ? "IDAT" : "fdAT",
+                    lv, strategy_name(st), wb, ml,
+                    (unsigned long long)psz);
+        }
+        if (pos+16 <= buf.size()) {
+            uint64_t total_raw =rd_le64(buf.data()+pos); pos+=8;
+            uint64_t lzma_sz   =rd_le64(buf.data()+pos);
+            fprintf(stdout, "  Solid LZMA: %llu → %llu (%.1f%%)\n",
+                    (unsigned long long)total_raw,
+                    (unsigned long long)lzma_sz,
+                    total_raw > 0 ? 100.0*lzma_sz/total_raw : 0.0);
+        }
+        return;
     }
+
+    fprintf(stdout, "  unknown PPG version %u\n", version);
 }
 
 /* ─── show help ──────────────────────────────────────────────────────────── */
@@ -1020,7 +1169,7 @@ static void list_ppg(const std::string& path) {
 static void show_help() {
     fprintf(stdout,
         "\n%spackPNG%s v0.%i%s  •  by %s\n"
-        "PNG/APNG lossless recompressor — brute-force zlib match + LZMA\n\n"
+        "PNG/APNG lossless recompressor — brute-force zlib match + solid LZMA\n\n"
         "Usage: packPNG [subcommand] [flags] file(s)\n\n"
         "Subcommands:\n"
         "  a            compress only (.png/.apng → .ppg)\n"
@@ -1036,6 +1185,7 @@ static void show_help() {
         "  -r           recurse into subdirectories\n"
         "  -dry         dry run (no output files)\n"
         "  -m<1-9>      LZMA preset (default 6)\n"
+        "  -me          LZMA extreme flag (slower, better ratio)\n"
         "  -th<N>       N file-level threads (0=auto)\n"
         "  -sfth        parallel brute-force within each file\n"
         "  -od<path>    write output to directory\n"
@@ -1043,7 +1193,7 @@ static void show_help() {
         "  --no-color   disable ANSI color\n\n"
         "Examples:\n"
         "  packPNG a -ver -o image.png\n"
-        "  packPNG a -sfth animation.apng\n"
+        "  packPNG a -me -sfth animation.apng\n"
         "  packPNG a -th4 -od out/ *.png\n"
         "  packPNG x archive.ppg\n\n",
         col(BC), col(R), appversion, subversion, author);
@@ -1068,17 +1218,18 @@ int main(int argc, char** argv)
 
     for (; ai < argc; ai++) {
         std::string arg = argv[ai];
-        if      (arg == "-ver")       verify    = true;
-        else if (arg == "-v0")        verbosity = 0;
-        else if (arg == "-v1")        verbosity = 1;
-        else if (arg == "-v2")        verbosity = 2;
-        else if (arg == "-np")        wait_exit = false;
-        else if (arg == "-o")         overwrite = true;
-        else if (arg == "-p")         err_tol   = 2;
-        else if (arg == "-r")         recursive = true;
-        else if (arg == "-dry")       dry_run   = true;
-        else if (arg == "-sfth")      sfth      = true;
-        else if (arg == "--no-color") no_color  = true;
+        if      (arg == "-ver")       verify       = true;
+        else if (arg == "-v0")        verbosity    = 0;
+        else if (arg == "-v1")        verbosity    = 1;
+        else if (arg == "-v2")        verbosity    = 2;
+        else if (arg == "-np")        wait_exit    = false;
+        else if (arg == "-o")         overwrite    = true;
+        else if (arg == "-p")         err_tol      = 2;
+        else if (arg == "-r")         recursive    = true;
+        else if (arg == "-dry")       dry_run      = true;
+        else if (arg == "-sfth")      sfth         = true;
+        else if (arg == "-me")        lzma_extreme = true;
+        else if (arg == "--no-color") no_color     = true;
         else if (arg == "-module")  { module_mode = true; wait_exit = false; }
         else if (arg.size() > 2 && arg.substr(0,2) == "-m") {
             int v = atoi(arg.c_str() + 2);
@@ -1099,13 +1250,11 @@ int main(int argc, char** argv)
             collect(arg);
     }
 
-    // Compute sfth_threads: only active when -sfth set and not also using -th
     if (sfth) {
         if (num_threads <= 1) {
             sfth_threads = (int)std::thread::hardware_concurrency();
             if (sfth_threads < 2) sfth_threads = 4;
         }
-        // If -th > 1: file-level parallelism takes priority; sfth stays 1
     }
 
     if (filelist.empty()) { show_help(); return 0; }
@@ -1115,7 +1264,6 @@ int main(int argc, char** argv)
                 col(BC), col(R), appversion, subversion, author);
     }
 
-    // List mode: inspect .ppg files without decompressing
     if (list_mode) {
         for (auto& f : filelist) list_ppg(f);
         if (wait_exit && !module_mode) { fprintf(stdout, "\nPress <enter> to quit\n"); getchar(); }
@@ -1127,7 +1275,6 @@ int main(int argc, char** argv)
     if (num_threads <= 1) {
         for (auto& f : filelist) process_file(f);
     } else {
-        // Thread pool: atomic index into filelist
         std::atomic<size_t> next_idx{0};
         std::vector<std::thread> workers;
         for (int t = 0; t < num_threads; t++) {
