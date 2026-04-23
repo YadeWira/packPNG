@@ -383,8 +383,8 @@ static std::vector<Candidate> build_candidates(const std::vector<uint8_t>& targe
     if (target.size() < 2) return {};
 
     // CMF byte (target[0]): bits 4-7 = CINFO, wbits = CINFO + 8.
-    int cinfo = (target[0] >> 4) & 0xF;
-    int wbits  = std::max(8, std::min(15, cinfo + 8));
+    int cinfo  = (target[0] >> 4) & 0xF;
+    int wbits0 = std::max(8, std::min(15, cinfo + 8));
 
     uint8_t flevel = (target[1] >> 6) & 3;
     int lv_min, lv_max;
@@ -398,19 +398,27 @@ static std::vector<Candidate> build_candidates(const std::vector<uint8_t>& targe
     static const int strats[] = {Z_DEFAULT_STRATEGY, Z_FILTERED, Z_HUFFMAN_ONLY, Z_RLE};
     std::vector<Candidate> c;
 
-    // Primary: memlevel=8 (zlib default)
-    if (lv_min <= 6 && 6 <= lv_max) c.push_back({6, Z_FILTERED, wbits, 8});
-    for (int lv = lv_min; lv <= lv_max; lv++)
-        for (int st : strats)
-            if (!(lv == 6 && st == Z_FILTERED))
-                c.push_back({lv, st, wbits, 8});
+    // Helper: add a full level×strategy sweep for given wbits+memlevel
+    auto add_sweep = [&](int wb, int ml) {
+        if (lv_min <= 6 && 6 <= lv_max) c.push_back({6, Z_FILTERED, wb, ml});
+        for (int lv = lv_min; lv <= lv_max; lv++)
+            for (int st : strats)
+                if (!(lv == 6 && st == Z_FILTERED))
+                    c.push_back({lv, st, wb, ml});
+    };
 
-    // Extended: memlevel=9
-    if (lv_min <= 6 && 6 <= lv_max) c.push_back({6, Z_FILTERED, wbits, 9});
-    for (int lv = lv_min; lv <= lv_max; lv++)
-        for (int st : strats)
-            if (!(lv == 6 && st == Z_FILTERED))
-                c.push_back({lv, st, wbits, 9});
+    // Primary: CMF-derived wbits, memlevel 8 (most common default)
+    add_sweep(wbits0, 8);
+    // Extended: memlevel 9 (slightly less common)
+    add_sweep(wbits0, 9);
+    // Rare: memlevel 1-7 (unusual encoders); probe phase-1 rejects quickly
+    for (int ml = 7; ml >= 1; ml--)
+        add_sweep(wbits0, ml);
+    // Fallback: wbits=15 if CMF-derived differs (some buggy encoders)
+    if (wbits0 != 15) {
+        add_sweep(15, 8);
+        add_sweep(15, 9);
+    }
 
     return c;
 }
