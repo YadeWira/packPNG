@@ -3,6 +3,7 @@ CXXFLAGS   = -std=c++17 -O3 -Wall -Wextra \
              -funroll-loops -fomit-frame-pointer \
              -march=native
 LIBS       = -lz -llzma
+LIBS_LDF   = -lz -llzma -ldeflate
 
 TARGET     = packPNG
 SRC        = packpng.cpp
@@ -26,12 +27,16 @@ MINGW_LIBS   = -static \
                -lstdc++ -lgcc -lgcc_eh -lws2_32
 WIN_TARGET   = packPNG.exe
 
-.PHONY: all clean asan win
+.PHONY: all ldf clean asan win
 
 all: $(TARGET)
 
 $(TARGET): $(SRC)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LIBS)
+
+# Build with libdeflate support (-ldf flag, faster inflate + mode-2 repack)
+ldf: $(SRC)
+	$(CXX) $(CXXFLAGS) -DUSE_LIBDEFLATE -o $(TARGET) $^ $(LIBS_LDF)
 
 asan: $(SRC)
 	$(CXX) $(CXXFLAGS) -fsanitize=address,undefined -g -o $(TARGET)_asan $^ $(LIBS)
