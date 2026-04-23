@@ -35,9 +35,9 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = ".5";
+static const char* subversion = "d";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   appversion = 2;   // v0.2.3
+static const int   appversion = 2;   // v0.2d
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
 
