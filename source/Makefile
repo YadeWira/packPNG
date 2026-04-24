@@ -4,6 +4,7 @@ CXXFLAGS   = -std=c++17 -O3 -Wall -Wextra \
              -march=native
 LIBS       = -lz -llzma
 LIBS_LDF   = -lz -llzma -ldeflate
+LIBS_ZSTD  = -lz -llzma -lzstd
 
 TARGET     = packPNG
 SRC        = packpng.cpp
@@ -27,7 +28,7 @@ MINGW_LIBS   = -static \
                -lstdc++ -lgcc -lgcc_eh -lws2_32
 WIN_TARGET   = packPNG.exe
 
-.PHONY: all ldf clean asan win
+.PHONY: all ldf zstd clean asan win
 
 all: $(TARGET)
 
@@ -37,6 +38,10 @@ $(TARGET): $(SRC)
 # Build with libdeflate support (-ldf flag, faster inflate + mode-2 repack)
 ldf: $(SRC)
 	$(CXX) $(CXXFLAGS) -DUSE_LIBDEFLATE -o $(TARGET) $^ $(LIBS_LDF)
+
+# Build with Zstd support (-zstd flag, solid Zstd block instead of LZMA)
+zstd: $(SRC)
+	$(CXX) $(CXXFLAGS) -DUSE_ZSTD -o $(TARGET) $^ $(LIBS_ZSTD)
 
 asan: $(SRC)
 	$(CXX) $(CXXFLAGS) -fsanitize=address,undefined -g -o $(TARGET)_asan $^ $(LIBS)
