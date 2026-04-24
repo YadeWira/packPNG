@@ -53,6 +53,7 @@ static const uint8_t PNG_SIG[8] = {0x89,'P','N','G','\r','\n',0x1a,'\n'};
 static const uint8_t PPG_SIG[4] = {'P','P','G','1'};
 static const size_t  PROBE_BYTES = 65536;
 static const int     MSG_SIZE    = 512;
+static const int     EARLYOUT_K  = 8;   // consecutive pre-filter failures before giving up
 
 /* ─── global options ─────────────────────────────────────────────────────── */
 
@@ -540,10 +541,14 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
 
     if (sfth_threads <= 1) {
         std::vector<uint8_t> tmp, attempt;
+        int consec_fails = 0;
         for (auto& c : cands) {
             if (!probe_deflate(px.data(), px.size(), tgt.data(), tgt.size(),
-                               c.lv, c.st, c.wbits, c.memlevel, tmp))
+                               c.lv, c.st, c.wbits, c.memlevel, tmp)) {
+                if (++consec_fails >= EARLYOUT_K) break;  // exotic encoder — stop probing
                 continue;
+            }
+            consec_fails = 0;
             if (full_deflate(px, tgt, c.lv, c.st, c.wbits, c.memlevel, attempt)) {
                 p = {c.lv, c.st, c.memlevel, c.wbits}; return true;
             }
@@ -553,6 +558,7 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
 
     std::atomic<bool> found{false};
     std::atomic<int>  next_cand{0};
+    std::atomic<int>  consec_fails{0};
     std::mutex        result_mu;
     DeflParams        result{};
     int nw = std::min(sfth_threads, (int)cands.size());
@@ -560,13 +566,16 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
     for (int t = 0; t < nw; t++) {
         workers.emplace_back([&]() {
             std::vector<uint8_t> tmp, attempt;
-            while (!found) {
+            while (!found && consec_fails.load(std::memory_order_relaxed) < EARLYOUT_K) {
                 int idx = next_cand.fetch_add(1);
                 if (idx >= (int)cands.size()) break;
                 auto& c = cands[idx];
                 if (!probe_deflate(px.data(), px.size(), tgt.data(), tgt.size(),
-                                   c.lv, c.st, c.wbits, c.memlevel, tmp))
+                                   c.lv, c.st, c.wbits, c.memlevel, tmp)) {
+                    consec_fails.fetch_add(1, std::memory_order_relaxed);
                     continue;
+                }
+                consec_fails.store(0, std::memory_order_relaxed);
                 if (full_deflate(px, tgt, c.lv, c.st, c.wbits, c.memlevel, attempt)) {
                     std::lock_guard<std::mutex> lk(result_mu);
                     if (!found) { result = {c.lv, c.st, c.memlevel, c.wbits}; found = true; }
