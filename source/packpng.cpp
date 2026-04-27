@@ -1,4 +1,4 @@
-/* packPNG v1.0 - PNG/APNG lossless recompressor
+/* packPNG v1.0a - PNG/APNG lossless recompressor
  *
  * Per-frame algorithm:
  *   PNG/APNG → parse frames → inflate pixels → brute-force zlib re-encode
@@ -39,6 +39,11 @@
 #  include <zstd.h>
 #endif
 
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#endif
+
 #if defined(_WIN32)
 #  include <windows.h>
 #  include <fcntl.h>
@@ -47,9 +52,9 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "";   // letra = bugfix-only; sin letra = feature
+static const char* subversion = "a";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   ver_major  = 1;   // v1.0 — stable release
+static const int   ver_major  = 1;   // v1.0a — UTF-8 console fix on Windows
 static const int   ver_minor  = 0;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
@@ -1566,6 +1571,10 @@ static void show_help() {
 
 int main(int argc, char** argv)
 {
+#ifdef _WIN32
+    // Console UTF-8 output so the bullets/arrows in banner/help render correctly
+    SetConsoleOutputCP(CP_UTF8);
+#endif
     init_colors();
     if (argc < 2) { show_help(); return 0; }
 

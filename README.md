@@ -106,6 +106,12 @@ All versions are decompressible by the current binary.
 
 Linux x86-64, Windows 10/11 x86-64.
 
+## Notes for Windows users
+
+- The `.exe` is a **mingw-w64 cross-compiled, statically linked** binary without an Authenticode signature. Windows Defender and other AVs may flag it as a generic heuristic detection (`Trojan:Win32/Wacatac`, `Win32/Heuristic`, etc.). This is a **false positive** — the binary contains no networking code and only reads/writes the files you point it at. You can verify on [VirusTotal](https://www.virustotal.com/) (most engines won't flag it; the few that do use generic names rather than specific signatures).
+- If Defender quarantines it, you can either submit it as a false positive at [Microsoft's submission portal](https://www.microsoft.com/en-us/wdsi/filesubmission) or build from source on Windows directly (locally compiled binaries don't trigger reputation-based heuristics).
+- `v1.0a` and later set the console code page to UTF-8 at startup so the banner renders correctly without needing `chcp 65001`.
+
 ## License
 
 MIT
