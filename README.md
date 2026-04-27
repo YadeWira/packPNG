@@ -21,6 +21,7 @@ Tested on a 30 MB corpus of 63 real-world PNGs:
 | Mode | Output size | Ratio |
 |------|-------------|-------|
 | default (LZMA) | 20.0 MB | 69.5% |
+| `-deep` | 19.6 MB | 65.0% (~2× slower, ~6% smaller) |
 | `-zstd` | 20.4 MB | 70.5% |
 
 Speed bottleneck is brute-force deflate matching, dominated by `deflateInit2` cost per candidate and full-deflate verification of the pixel buffer. For PNGs from non-standard encoders (zlib-ng, libdeflate, oxipng, zopfli) where no match is found, frames fall back to `[stored]` mode — the IDAT is kept as-is and only LZMA-compressed.
@@ -68,6 +69,7 @@ Flags:
   -dry         dry run (no output files written)
   -m<1-9>      LZMA preset (default 6)
   -me          LZMA extreme flag (slower, better ratio)
+  -deep        disable brute-force early-out (~2x slower, ~6% smaller output)
   -ldf         libdeflate pixel-exact fallback for unmatched frames (PPG v5)
   -zstd        use Zstd instead of LZMA (PPG v6/v7)
   -zl=<1-22>   Zstd level (default 19, requires -zstd)

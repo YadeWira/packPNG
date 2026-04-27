@@ -1,4 +1,4 @@
-/* packPNG v1.0f - PNG/APNG lossless recompressor
+/* packPNG v1.0g - PNG/APNG lossless recompressor
  *
  * Per-frame algorithm:
  *   PNG/APNG → parse frames → inflate pixels → brute-force zlib re-encode
@@ -52,9 +52,9 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "f";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "g";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   ver_major  = 1;   // v1.0f — -sfth single-file mode now also parallelizes LZMA (2.66× speedup)
+static const int   ver_major  = 1;   // v1.0g — -deep flag: max-ratio mode (-6.5 % bytes, ~2× time)
 static const int   ver_minor  = 0;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
@@ -63,7 +63,7 @@ static const uint8_t PNG_SIG[8] = {0x89,'P','N','G','\r','\n',0x1a,'\n'};
 static const uint8_t PPG_SIG[4] = {'P','P','G','1'};
 static const size_t  PROBE_BYTES    = 65536;
 static const int     MSG_SIZE       = 512;
-static const int     EARLYOUT_K     = 8;   // bail after K consecutive probe failures
+static       int     EARLYOUT_K     = 8;   // bail after K consecutive probe failures (-deep raises it)
 static const int     MAX_FULL_CALLS = 20;  // cap on expensive full_deflate calls per IDAT
 
 /* ─── global options ─────────────────────────────────────────────────────── */
@@ -1666,6 +1666,7 @@ static void show_help() {
         "  -dry         dry run (no output files)\n"
         "  -m<1-9>      LZMA preset (default 6)\n"
         "  -me          LZMA extreme flag (slower, better ratio)\n"
+        "  -deep        disable brute-force early-out (~2x slower, ~6%% smaller)\n"
         "  -ldf         libdeflate pixel-exact fallback for unmatched frames (PPG v5)\n"
         "  -th<N>       N file-level threads (0=auto)\n"
         "  -sfth        parallel brute-force + MT-LZMA within each file (4 threads, single-file mode; -th<N/4> for batch)\n"
@@ -1713,6 +1714,7 @@ int main(int argc, char** argv)
         else if (arg == "-r")         recursive    = true;
         else if (arg == "-dry")       dry_run      = true;
         else if (arg == "-sfth")      sfth         = true;
+        else if (arg == "-deep")      EARLYOUT_K   = 1 << 30;  // disable early-out → better ratio, ~2× time
         else if (arg == "-me")        lzma_extreme = true;
         else if (arg == "-ldf")       ldf_repack   = true;
         else if (arg == "-zstd")      use_zstd     = true;
