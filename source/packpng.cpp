@@ -1,4 +1,4 @@
-/* packPNG v1.0c - PNG/APNG lossless recompressor
+/* packPNG v1.0d - PNG/APNG lossless recompressor
  *
  * Per-frame algorithm:
  *   PNG/APNG → parse frames → inflate pixels → brute-force zlib re-encode
@@ -52,9 +52,9 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "c";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "d";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   ver_major  = 1;   // v1.0c — -sfth packJPG-style: fixed cap 4, combinable with -thN
+static const int   ver_major  = 1;   // v1.0d — restore EARLYOUT_K (=12) Pareto sweet spot
 static const int   ver_minor  = 0;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
@@ -63,6 +63,7 @@ static const uint8_t PNG_SIG[8] = {0x89,'P','N','G','\r','\n',0x1a,'\n'};
 static const uint8_t PPG_SIG[4] = {'P','P','G','1'};
 static const size_t  PROBE_BYTES    = 65536;
 static const int     MSG_SIZE       = 512;
+static const int     EARLYOUT_K     = 12;  // bail after K consecutive probe failures (Pareto sweet spot)
 static const int     MAX_FULL_CALLS = 20;  // cap on expensive full_deflate calls per IDAT
 
 /* ─── global options ─────────────────────────────────────────────────────── */
@@ -571,12 +572,14 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
 
     if (sfth_threads <= 1) {
         std::vector<uint8_t> tmp, attempt;
-        int full_calls = 0;
+        int full_calls = 0, consec_fails = 0;
         for (auto& c : cands) {
             if (!probe_deflate(px.data(), px.size(), tgt.data(), tgt.size(),
                                c.lv, c.st, c.wbits, c.memlevel, tmp)) {
+                if (++consec_fails >= EARLYOUT_K) break;  // exotic encoder — stop probing
                 continue;
             }
+            consec_fails = 0;
             if (++full_calls > MAX_FULL_CALLS) break;     // cap expensive false-positive sweeps
             if (full_deflate(px, tgt, c.lv, c.st, c.wbits, c.memlevel, attempt)) {
                 p = {c.lv, c.st, c.memlevel, c.wbits}; return true;
@@ -588,6 +591,7 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
     std::atomic<bool> found{false};
     std::atomic<int>  next_cand{0};
     std::atomic<int>  full_calls{0};
+    std::atomic<int>  consec_fails{0};
     std::mutex        result_mu;
     DeflParams        result{};
     int nw = std::min(sfth_threads, (int)cands.size());
@@ -596,14 +600,17 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
         workers.emplace_back([&]() {
             std::vector<uint8_t> tmp, attempt;
             while (!found
+                   && consec_fails.load(std::memory_order_relaxed) < EARLYOUT_K
                    && full_calls.load(std::memory_order_relaxed) <= MAX_FULL_CALLS) {
                 int idx = next_cand.fetch_add(1);
                 if (idx >= (int)cands.size()) break;
                 auto& c = cands[idx];
                 if (!probe_deflate(px.data(), px.size(), tgt.data(), tgt.size(),
                                    c.lv, c.st, c.wbits, c.memlevel, tmp)) {
+                    consec_fails.fetch_add(1, std::memory_order_relaxed);
                     continue;
                 }
+                consec_fails.store(0, std::memory_order_relaxed);
                 if (full_calls.fetch_add(1, std::memory_order_relaxed) >= MAX_FULL_CALLS) break;
                 if (full_deflate(px, tgt, c.lv, c.st, c.wbits, c.memlevel, attempt)) {
                     std::lock_guard<std::mutex> lk(result_mu);

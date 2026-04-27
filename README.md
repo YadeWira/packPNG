@@ -7,7 +7,7 @@ The `.ppg` container format (versions v3–v7) is now stable. Future v1.x releas
 ## How it works
 
 1. **Parse** PNG/APNG into frames and inflate each IDAT stream to raw pixels
-2. **Brute-force** all zlib parameter combinations (level, strategy, window bits, memlevel) to find the one that reproduces the original deflate stream byte-exactly. Bailouts: O(1) zlib-header pre-filter (CMETHOD/FDICT/checksum) and a cap of 20 full-deflate calls per IDAT (the cheap probe phase always runs to completion to avoid missing matches deep in the sweep).
+2. **Brute-force** all zlib parameter combinations (level, strategy, window bits, memlevel) to find the one that reproduces the original deflate stream byte-exactly. Bailouts: O(1) zlib-header pre-filter (CMETHOD/FDICT/checksum), early-out after K=12 consecutive probe failures (Pareto-optimal between exotic-encoder fast-bail and missing real matches), cap of 20 full-deflate calls per IDAT.
 3. **Separate** PNG filter bytes from pixel data (one filter byte per scanline interleaves with pixel bytes — separating them improves LZMA's LZ77 matching)
 4. **Compress** all frames together in one solid block — LZMA by default (image-tuned `lc=4`), or Zstd with `-zstd`
 5. Output: `.ppg` file, fully reversible back to the original PNG/APNG (byte-exact)
@@ -20,8 +20,8 @@ Tested on a 30 MB corpus of 63 real-world PNGs:
 
 | Mode | Output size | Ratio |
 |------|-------------|-------|
-| default (LZMA) | 18.7 MB | 65.0% |
-| `-zstd` | 19.5 MB | 67.9% |
+| default (LZMA) | 19.1 MB | 66.4% |
+| `-zstd` | 19.9 MB | 69.4% |
 
 Speed bottleneck is brute-force deflate matching, dominated by `deflateInit2` cost per candidate and full-deflate verification of the pixel buffer. For PNGs from non-standard encoders (zlib-ng, libdeflate, oxipng, zopfli) where no match is found, frames fall back to `[stored]` mode — the IDAT is kept as-is and only LZMA-compressed.
 
