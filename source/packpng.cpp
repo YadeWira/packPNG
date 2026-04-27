@@ -1,4 +1,4 @@
-/* packPNG v1.0a - PNG/APNG lossless recompressor
+/* packPNG v1.0b - PNG/APNG lossless recompressor
  *
  * Per-frame algorithm:
  *   PNG/APNG → parse frames → inflate pixels → brute-force zlib re-encode
@@ -52,9 +52,9 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "a";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "b";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   ver_major  = 1;   // v1.0a — UTF-8 console fix on Windows
+static const int   ver_major  = 1;   // v1.0b — packJPG-style progress bar (multi-file UI)
 static const int   ver_minor  = 0;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
@@ -103,6 +103,19 @@ static std::atomic<int>    g_processed{0};
 static std::atomic<int>    g_errors{0};
 static std::atomic<double> g_acc_in{0.0};
 static std::atomic<double> g_acc_out{0.0};
+
+/* ─── progress bar (active only at v0 with >1 file in non-module mode) ───── */
+
+static const int BARLEN = 36;
+static std::atomic<int> g_files_done{0};
+static std::atomic<int> g_spinner_idx{0};
+static int  g_total_files = 0;
+static bool g_show_bar    = false;
+
+// Forward declarations — implementations after process_file
+static void clear_bar();
+static void draw_bar(int done);
+static void finish_bar();
 
 /* ─── color ──────────────────────────────────────────────────────────────── */
 
@@ -756,6 +769,7 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
 
         if (verbosity >= 1) {
             std::lock_guard<std::mutex> lk(g_print_mutex);
+            clear_bar();
             if (fe.matched)
                 fprintf(stdout,
                     "  %s[match]%s  lv=%d st=%s wb=%d ml=%d  px=%zu  idat=%zu%s\n",
@@ -807,6 +821,7 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
 
     if (verbosity >= 1) {
         std::lock_guard<std::mutex> lk(g_print_mutex);
+        clear_bar();
         fprintf(stdout, "  solid %s: %zu → %zu (%.1f%%)\n",
                 comp_label, total_payload, comp_data.size(),
                 total_payload > 0 ? 100.0 * comp_data.size() / total_payload : 0.0);
@@ -1302,6 +1317,50 @@ static std::string make_outpath(const std::string& inpath, const std::string& ex
 
 /* ─── process one file ───────────────────────────────────────────────────── */
 
+// Bar helpers — caller must hold g_print_mutex.
+static void clear_bar() {
+    if (!g_show_bar) return;
+    fprintf(stdout, "\r%*s\r", BARLEN + 34, "");
+}
+
+static void draw_bar(int done) {
+    if (!g_show_bar) return;
+    int total = g_total_files > 0 ? g_total_files : 1;
+    int barpos = (done * BARLEN) / total;
+#if defined(_WIN32)
+    static const char* spinners[] = { "-", "\\", "|", "/" };
+    const char* spin = spinners[g_spinner_idx.fetch_add(1, std::memory_order_relaxed) % 4];
+    const char* fill = "#"; const char* empty = " ";
+#else
+    static const char* spinners[] = {
+        "\xe2\xa0\x8b","\xe2\xa0\x99","\xe2\xa0\xb9","\xe2\xa0\xb8","\xe2\xa0\xbc",
+        "\xe2\xa0\xb4","\xe2\xa0\xa6","\xe2\xa0\xa7","\xe2\xa0\x87","\xe2\xa0\x8f"
+    };
+    const char* spin = spinners[g_spinner_idx.fetch_add(1, std::memory_order_relaxed) % 10];
+    const char* fill = "\xe2\x96\x88"; const char* empty = "\xe2\x96\x91";
+#endif
+    fprintf(stdout, "\r  %s  %3i / %-3i  %s[", spin, done, total, col(BC));
+    for (int b = 0; b < barpos; b++)         fputs(fill,  stdout);
+    fputs(col(R), stdout);
+    for (int b = barpos; b < BARLEN; b++)    fputs(empty, stdout);
+    fputs("]", stdout);
+    fflush(stdout);
+}
+
+static void finish_bar() {
+    if (!g_show_bar) return;
+    int total = g_total_files;
+#if defined(_WIN32)
+    const char* check = "+"; const char* fill = "#";
+#else
+    const char* check = "\xe2\x9c\x93"; const char* fill = "\xe2\x96\x88";
+#endif
+    fprintf(stdout, "\r  %s  %3i / %-3i  %s[", check, total, total, col(BC));
+    for (int b = 0; b < BARLEN; b++) fputs(fill, stdout);
+    fprintf(stdout, "%s]   \n", col(R));
+    fflush(stdout);
+}
+
 static void process_file(const std::string& inpath) {
     namespace fs = std::filesystem;
     FileType ft = detect_type(inpath);
@@ -1315,6 +1374,7 @@ static void process_file(const std::string& inpath) {
 
     if (!overwrite && fs::exists(outpath)) {
         std::lock_guard<std::mutex> lk(g_print_mutex);
+        clear_bar();
         fprintf(stderr, "%sERROR%s %s: output exists\n", col(RD), col(R), inpath.c_str());
         g_errors++;
         return;
@@ -1324,6 +1384,7 @@ static void process_file(const std::string& inpath) {
     auto in = read_file(inpath);
     if (in.empty()) {
         std::lock_guard<std::mutex> lk(g_print_mutex);
+        clear_bar();
         fprintf(stderr, "%sERROR%s %s: cannot read\n", col(RD), col(R), inpath.c_str());
         g_errors++;
         return;
@@ -1333,6 +1394,7 @@ static void process_file(const std::string& inpath) {
     bool ok = do_compress ? compress_png(in, out) : decompress_ppg(in, out);
     if (!ok) {
         std::lock_guard<std::mutex> lk(g_print_mutex);
+        clear_bar();
         fprintf(stderr, "%sERROR%s %s: %s\n", col(RD), col(R), inpath.c_str(), errormessage);
         g_errors++;
         return;
@@ -1347,6 +1409,7 @@ static void process_file(const std::string& inpath) {
             bool match = ldf_repack ? compare_png_pixels(rt, in) : (rt == in);
             if (!vok || !match) {
                 std::lock_guard<std::mutex> lk(g_print_mutex);
+                clear_bar();
                 fprintf(stderr, "%sERROR%s %s: round-trip mismatch\n", col(RD), col(R), inpath.c_str());
                 g_errors++;
                 return;
@@ -1355,6 +1418,7 @@ static void process_file(const std::string& inpath) {
             vok = decompress_ppg(in, rt);
             if (!vok || rt != out) {
                 std::lock_guard<std::mutex> lk(g_print_mutex);
+                clear_bar();
                 fprintf(stderr, "%sERROR%s %s: round-trip mismatch\n", col(RD), col(R), inpath.c_str());
                 g_errors++;
                 return;
@@ -1364,6 +1428,7 @@ static void process_file(const std::string& inpath) {
 
     if (!dry_run && !write_file(outpath, out)) {
         std::lock_guard<std::mutex> lk(g_print_mutex);
+        clear_bar();
         fprintf(stderr, "%sERROR%s %s: cannot write output\n", col(RD), col(R), inpath.c_str());
         g_errors++;
         return;
@@ -1372,16 +1437,20 @@ static void process_file(const std::string& inpath) {
     double ratio = in_sz > 0 ? 100.0 * out.size() / in_sz : 0.0;
     {
         std::lock_guard<std::mutex> lk(g_print_mutex);
-        if (!module_mode) {
+        // Per-file line: skipped at v0 when bar is active (bar replaces it).
+        if (!module_mode && (verbosity >= 1 || !g_show_bar)) {
             bool expanded = (ratio > 100.0);
             const char* pc = expanded ? col(YL) : col(GR);
+            clear_bar();   // no-op when !g_show_bar
             fprintf(stdout, "%s%s%s -> %s%s%s  %.2f%%%s\n",
                     pc, inpath.c_str(), col(R),
                     pc, outpath.c_str(), col(R), ratio,
                     expanded ? " [incompressible — consider skipping]" : "");
         }
+        g_processed++;
+        int done = g_files_done.fetch_add(1, std::memory_order_relaxed) + 1;
+        draw_bar(done);
     }
-    g_processed++;
     double prev = g_acc_in.load();
     while (!g_acc_in.compare_exchange_weak(prev, prev + (double)in_sz)) {}
     prev = g_acc_out.load();
@@ -1650,6 +1719,9 @@ int main(int argc, char** argv)
 
     auto t0 = std::chrono::steady_clock::now();
 
+    g_total_files = (int)filelist.size();
+    g_show_bar    = !module_mode && g_total_files > 1;
+
     if (num_threads <= 1) {
         for (auto& f : filelist) process_file(f);
     } else {
@@ -1665,6 +1737,12 @@ int main(int argc, char** argv)
             });
         }
         for (auto& w : workers) w.join();
+    }
+
+    // Replace the in-progress bar with a final completed bar (✓ done/total).
+    if (g_show_bar) {
+        std::lock_guard<std::mutex> lk(g_print_mutex);
+        finish_bar();
     }
 
     auto t1 = std::chrono::steady_clock::now();
