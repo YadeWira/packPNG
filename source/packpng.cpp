@@ -1,4 +1,4 @@
-/* packPNG v0.5 - PNG/APNG lossless recompressor
+/* packPNG v1.0 - PNG/APNG lossless recompressor
  *
  * Per-frame algorithm:
  *   PNG/APNG → parse frames → inflate pixels → brute-force zlib re-encode
@@ -49,7 +49,8 @@
 
 static const char* subversion = "";   // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   appversion = 5;   // v0.5
+static const int   ver_major  = 1;   // v1.0 — stable release
+static const int   ver_minor  = 0;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
 
@@ -1529,7 +1530,7 @@ static void list_ppg(const std::string& path) {
 
 static void show_help() {
     fprintf(stdout,
-        "\n%spackPNG%s v0.%i%s  •  by %s\n"
+        "\n%spackPNG%s v%d.%d%s  •  by %s\n"
         "PNG/APNG lossless recompressor — brute-force zlib match + solid LZMA\n\n"
         "Usage: packPNG [subcommand] [flags] file(s)\n\n"
         "Subcommands:\n"
@@ -1558,7 +1559,7 @@ static void show_help() {
         "  packPNG a -me -sfth animation.apng\n"
         "  packPNG a -th4 -od out/ *.png\n"
         "  packPNG x archive.ppg\n\n",
-        col(BC), col(R), appversion, subversion, author);
+        col(BC), col(R), ver_major, ver_minor, subversion, author);
 }
 
 /* ─── main ───────────────────────────────────────────────────────────────── */
@@ -1628,8 +1629,8 @@ int main(int argc, char** argv)
     if (filelist.empty()) { show_help(); return 0; }
 
     if (!module_mode) {
-        fprintf(stdout, "\n%spackPNG%s v0.%i%s  •  by %s\n\n",
-                col(BC), col(R), appversion, subversion, author);
+        fprintf(stdout, "\n%spackPNG%s v%d.%d%s  •  by %s\n\n",
+                col(BC), col(R), ver_major, ver_minor, subversion, author);
     }
 
     if (list_mode) {
