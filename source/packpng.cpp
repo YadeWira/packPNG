@@ -1,4 +1,4 @@
-/* packPNG v1.0d - PNG/APNG lossless recompressor
+/* packPNG v1.0e - PNG/APNG lossless recompressor
  *
  * Per-frame algorithm:
  *   PNG/APNG → parse frames → inflate pixels → brute-force zlib re-encode
@@ -52,9 +52,9 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "d";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "e";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   ver_major  = 1;   // v1.0d — restore EARLYOUT_K (=12) Pareto sweet spot
+static const int   ver_major  = 1;   // v1.0e — revert EARLYOUT_K to 8 (v1.0b speed); keep -sfth packJPG-style
 static const int   ver_minor  = 0;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
@@ -63,7 +63,7 @@ static const uint8_t PNG_SIG[8] = {0x89,'P','N','G','\r','\n',0x1a,'\n'};
 static const uint8_t PPG_SIG[4] = {'P','P','G','1'};
 static const size_t  PROBE_BYTES    = 65536;
 static const int     MSG_SIZE       = 512;
-static const int     EARLYOUT_K     = 12;  // bail after K consecutive probe failures (Pareto sweet spot)
+static const int     EARLYOUT_K     = 8;   // bail after K consecutive probe failures
 static const int     MAX_FULL_CALLS = 20;  // cap on expensive full_deflate calls per IDAT
 
 /* ─── global options ─────────────────────────────────────────────────────── */
