@@ -1,4 +1,4 @@
-/* packPNG v1.0b - PNG/APNG lossless recompressor
+/* packPNG v1.0c - PNG/APNG lossless recompressor
  *
  * Per-frame algorithm:
  *   PNG/APNG → parse frames → inflate pixels → brute-force zlib re-encode
@@ -52,9 +52,9 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "b";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "c";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   ver_major  = 1;   // v1.0b — packJPG-style progress bar (multi-file UI)
+static const int   ver_major  = 1;   // v1.0c — -sfth packJPG-style: fixed cap 4, combinable with -thN
 static const int   ver_minor  = 0;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
@@ -63,8 +63,7 @@ static const uint8_t PNG_SIG[8] = {0x89,'P','N','G','\r','\n',0x1a,'\n'};
 static const uint8_t PPG_SIG[4] = {'P','P','G','1'};
 static const size_t  PROBE_BYTES    = 65536;
 static const int     MSG_SIZE       = 512;
-static const int     EARLYOUT_K     = 8;   // consecutive probe failures before giving up
-static const int     MAX_FULL_CALLS = 20;  // max full_deflate calls per IDAT (caps false-positive sweeps)
+static const int     MAX_FULL_CALLS = 20;  // cap on expensive full_deflate calls per IDAT
 
 /* ─── global options ─────────────────────────────────────────────────────── */
 
@@ -572,15 +571,13 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
 
     if (sfth_threads <= 1) {
         std::vector<uint8_t> tmp, attempt;
-        int consec_fails = 0, full_calls = 0;
+        int full_calls = 0;
         for (auto& c : cands) {
             if (!probe_deflate(px.data(), px.size(), tgt.data(), tgt.size(),
                                c.lv, c.st, c.wbits, c.memlevel, tmp)) {
-                if (++consec_fails >= EARLYOUT_K) break;  // exotic encoder — stop probing
                 continue;
             }
-            consec_fails = 0;
-            if (++full_calls > MAX_FULL_CALLS) break;     // too many probe false-positives
+            if (++full_calls > MAX_FULL_CALLS) break;     // cap expensive false-positive sweeps
             if (full_deflate(px, tgt, c.lv, c.st, c.wbits, c.memlevel, attempt)) {
                 p = {c.lv, c.st, c.memlevel, c.wbits}; return true;
             }
@@ -590,7 +587,6 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
 
     std::atomic<bool> found{false};
     std::atomic<int>  next_cand{0};
-    std::atomic<int>  consec_fails{0};
     std::atomic<int>  full_calls{0};
     std::mutex        result_mu;
     DeflParams        result{};
@@ -600,17 +596,14 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
         workers.emplace_back([&]() {
             std::vector<uint8_t> tmp, attempt;
             while (!found
-                   && consec_fails.load(std::memory_order_relaxed) < EARLYOUT_K
                    && full_calls.load(std::memory_order_relaxed) <= MAX_FULL_CALLS) {
                 int idx = next_cand.fetch_add(1);
                 if (idx >= (int)cands.size()) break;
                 auto& c = cands[idx];
                 if (!probe_deflate(px.data(), px.size(), tgt.data(), tgt.size(),
                                    c.lv, c.st, c.wbits, c.memlevel, tmp)) {
-                    consec_fails.fetch_add(1, std::memory_order_relaxed);
                     continue;
                 }
-                consec_fails.store(0, std::memory_order_relaxed);
                 if (full_calls.fetch_add(1, std::memory_order_relaxed) >= MAX_FULL_CALLS) break;
                 if (full_deflate(px, tgt, c.lv, c.st, c.wbits, c.memlevel, attempt)) {
                     std::lock_guard<std::mutex> lk(result_mu);
@@ -1624,7 +1617,7 @@ static void show_help() {
         "  -me          LZMA extreme flag (slower, better ratio)\n"
         "  -ldf         libdeflate pixel-exact fallback for unmatched frames (PPG v5)\n"
         "  -th<N>       N file-level threads (0=auto)\n"
-        "  -sfth        parallel brute-force within each file\n"
+        "  -sfth        parallel brute-force within each file (4 threads; combine as -th<N/4> -sfth)\n"
         "  -od<path>    write output to directory\n"
         "  -module      machine-friendly output\n"
         "  --no-color   disable ANSI color\n\n"
@@ -1698,9 +1691,14 @@ int main(int argc, char** argv)
     }
 
     if (sfth) {
-        if (num_threads <= 1) {
-            sfth_threads = (int)std::thread::hardware_concurrency();
-            if (sfth_threads < 2) sfth_threads = 4;
+        // packJPG-style: fixed cap regardless of -thN. Combine as -th<N/4> -sfth.
+        // Cap at 4 because beyond that the brute-force candidate sweep hits
+        // diminishing returns (atomic counter + result mutex contention).
+        int hw = (int)std::thread::hardware_concurrency();
+        if (hw < 1) hw = 1;
+        sfth_threads = std::min(4, hw);
+        if (!module_mode && hw < 4) {
+            fprintf(stderr, "Warning: -sfth works best with 4+ cores (detected: %d)\n", hw);
         }
     }
 
