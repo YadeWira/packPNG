@@ -9,7 +9,7 @@ The `.ppg` container format (versions v3–v7) is now stable. Future v1.x releas
 1. **Parse** PNG/APNG into frames and inflate each IDAT stream to raw pixels
 2. **Brute-force** all zlib parameter combinations (level, strategy, window bits, memlevel) to find the one that reproduces the original deflate stream byte-exactly. Bailouts: O(1) zlib-header pre-filter (CMETHOD/FDICT/checksum), early-out after K=8 consecutive probe failures, cap of 20 full-deflate calls per IDAT.
 3. **Separate** PNG filter bytes from pixel data (one filter byte per scanline interleaves with pixel bytes — separating them improves LZMA's LZ77 matching)
-4. **Compress** all frames together in one solid block — LZMA by default (image-tuned `lc=4`), or Zstd with `-zstd`
+4. **Compress** all frames together in one solid block — LZMA by default (image-tuned `lc=4`), or Zstd with `-zstd`. `-sfth` in single-file mode enables MT-LZMA (`lzma_stream_encoder_mt`, 256 KB blocks, 4 threads) for ~2.7× faster compression of large files at ~0.8 % ratio cost.
 5. Output: `.ppg` file, fully reversible back to the original PNG/APNG (byte-exact)
 
 With `-ldf`: frames that don't match any zlib parameter combination are stored as raw pixels and re-encoded with libdeflate at decompression time (pixel-exact, not byte-exact).
