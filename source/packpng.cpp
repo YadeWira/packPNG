@@ -1,4 +1,4 @@
-/* packPNG v1.0g - PNG/APNG lossless recompressor
+/* packPNG v1.0h - PNG/APNG lossless recompressor
  *
  * Per-frame algorithm:
  *   PNG/APNG → parse frames → inflate pixels → brute-force zlib re-encode
@@ -52,9 +52,9 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "g";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "h";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   ver_major  = 1;   // v1.0g — -deep flag: max-ratio mode (-6.5 % bytes, ~2× time)
+static const int   ver_major  = 1;   // v1.0h — throttle progress bar (fix Windows console regression)
 static const int   ver_minor  = 0;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
@@ -1370,6 +1370,17 @@ static void clear_bar() {
 static void draw_bar(int done) {
     if (!g_show_bar) return;
     int total = g_total_files > 0 ? g_total_files : 1;
+    // Throttle: skip redraw if <50ms since last; always draw the final.
+    // Windows console rendering is slow (~25ms/redraw with ANSI); throttling
+    // shaves up to 12s on a 450-file batch. Linux terminals are fast either way.
+    static std::atomic<int64_t> last_draw_ms{0};
+    if (done < total) {
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        int64_t prev = last_draw_ms.load(std::memory_order_relaxed);
+        if (now_ms - prev < 50) return;
+        last_draw_ms.store(now_ms, std::memory_order_relaxed);
+    }
     int barpos = (done * BARLEN) / total;
 #if defined(_WIN32)
     static const char* spinners[] = { "-", "\\", "|", "/" };
