@@ -1,4 +1,4 @@
-/* packPNG v1.0h - PNG/APNG lossless recompressor
+/* packPNG v1.0i - PNG/APNG lossless recompressor
  *
  * Per-frame algorithm:
  *   PNG/APNG → parse frames → inflate pixels → brute-force zlib re-encode
@@ -52,9 +52,9 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "h";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "i";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   ver_major  = 1;   // v1.0h — throttle progress bar (fix Windows console regression)
+static const int   ver_major  = 1;   // v1.0i — lazy -sfth: try cand 0 serially, only MT for rest
 static const int   ver_minor  = 0;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
@@ -588,13 +588,33 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
         return false;
     }
 
+    // Lazy MT: most libpng-default PNGs match the first candidate. Spawning 4
+    // threads costs ~5ms on Windows — worse than the single probe + full_deflate
+    // for those files. Try the first candidate sequentially first; only fall
+    // back to MT for the remaining candidates if it doesn't match.
+    int sched_full_calls = 0, sched_consec_fails = 0;
+    {
+        std::vector<uint8_t> tmp, attempt;
+        auto& c = cands[0];
+        if (probe_deflate(px.data(), px.size(), tgt.data(), tgt.size(),
+                          c.lv, c.st, c.wbits, c.memlevel, tmp)) {
+            sched_full_calls = 1;
+            if (full_deflate(px, tgt, c.lv, c.st, c.wbits, c.memlevel, attempt)) {
+                p = {c.lv, c.st, c.memlevel, c.wbits}; return true;
+            }
+        } else {
+            sched_consec_fails = 1;
+        }
+    }
+    if (cands.size() <= 1) return false;
+
     std::atomic<bool> found{false};
-    std::atomic<int>  next_cand{0};
-    std::atomic<int>  full_calls{0};
-    std::atomic<int>  consec_fails{0};
+    std::atomic<int>  next_cand{1};                            // start at candidate 1
+    std::atomic<int>  full_calls{sched_full_calls};
+    std::atomic<int>  consec_fails{sched_consec_fails};
     std::mutex        result_mu;
     DeflParams        result{};
-    int nw = std::min(sfth_threads, (int)cands.size());
+    int nw = std::min(sfth_threads, (int)cands.size() - 1);
     std::vector<std::thread> workers;
     for (int t = 0; t < nw; t++) {
         workers.emplace_back([&]() {
