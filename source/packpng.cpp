@@ -615,12 +615,18 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
     std::mutex        result_mu;
     DeflParams        result{};
     int nw = std::min(sfth_threads, (int)cands.size() - 1);
+    // Audit fix #9: in MT, consec_fails is shared across workers — ANY thread's
+    // probe success resets it. So the same EARLYOUT_K threshold fires later than
+    // in single-thread (where consec_fails is per-thread). Scale by nw to keep
+    // roughly the same per-thread sensitivity. Avoids wasted CPU on exotic-encoder
+    // images that single-thread would early-out on.
+    int mt_earlyout_k = EARLYOUT_K * nw;
     std::vector<std::thread> workers;
     for (int t = 0; t < nw; t++) {
-        workers.emplace_back([&]() {
+        workers.emplace_back([&, mt_earlyout_k]() {
             std::vector<uint8_t> tmp, attempt;
             while (!found
-                   && consec_fails.load(std::memory_order_relaxed) < EARLYOUT_K
+                   && consec_fails.load(std::memory_order_relaxed) < mt_earlyout_k
                    && full_calls.load(std::memory_order_relaxed) <= MAX_FULL_CALLS) {
                 int idx = next_cand.fetch_add(1);
                 if (idx >= (int)cands.size()) break;
@@ -1040,7 +1046,8 @@ static bool read_frame_v2(const uint8_t* p, size_t sz, size_t& pos, FrameMeta& f
     fm.memlevel = p[pos++];
     if (pos + 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (n_chunks)"); return false; }
     uint32_t nc = rd_le32(p + pos); pos += 4;
-    if (pos + nc * 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (chunk_szs)"); return false; }
+    // Audit fix #4: cast to uint64_t to avoid uint32 overflow when nc > 0x40000000.
+    if ((uint64_t)nc * 4 > sz - pos) { snprintf(errormessage, MSG_SIZE, "PPG truncated (chunk_szs)"); return false; }
     fm.chunk_szs.resize(nc);
     for (uint32_t i = 0; i < nc; i++) { fm.chunk_szs[i] = rd_le32(p + pos); pos += 4; }
     if (pos + 16 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (sizes)"); return false; }
@@ -1078,7 +1085,8 @@ static bool read_frame_solid_meta(const uint8_t* p, size_t sz, size_t& pos,
     fm.memlevel = p[pos++];
     if (pos + 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (n_chunks)"); return false; }
     uint32_t nc = rd_le32(p + pos); pos += 4;
-    if (pos + nc * 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (chunk_szs)"); return false; }
+    // Audit fix #4: cast to uint64_t to avoid uint32 overflow when nc > 0x40000000.
+    if ((uint64_t)nc * 4 > sz - pos) { snprintf(errormessage, MSG_SIZE, "PPG truncated (chunk_szs)"); return false; }
     fm.chunk_szs.resize(nc);
     for (uint32_t i = 0; i < nc; i++) { fm.chunk_szs[i] = rd_le32(p + pos); pos += 4; }
     if (pos + 8 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (payload_sz)"); return false; }
@@ -1193,6 +1201,12 @@ static bool decompress_solid(const uint8_t* p, size_t sz, size_t pos,
     std::vector<uint8_t> post(p + pos, p + pos + post_sz); pos += post_sz;
     uint32_t num_frames = rd_le32(p + pos); pos += 4;
     (void)is_apng;
+    // Audit fix #3: cap num_frames by remaining file size. Solid frame meta is at
+    // least 1 (uses_idat) + 5 (deflate params) + 4 (n_chunks) + 8 (payload_sz) = 18 bytes
+    // when there's no fctl/first_seq/chunks. Use 18 as conservative lower bound.
+    if (num_frames > (sz - pos) / 18 + 1) {
+        snprintf(errormessage, MSG_SIZE, "PPG solid num_frames implausible (%u)", num_frames); return false;
+    }
 
     std::vector<FrameMeta> frames(num_frames);
     std::vector<uint64_t>  payload_szs(num_frames);
@@ -1253,19 +1267,32 @@ static bool decompress_ppg(const std::vector<uint8_t>& ppg_buf,
     uint8_t version = p[pos++];
 
     if (version == 1) {
-        if (pos >= sz) { snprintf(errormessage, MSG_SIZE, "PPG v1 truncated"); return false; }
+        // Audit fix #1: bounds-check every read; reject huge n_idat that would OOM.
+        if (pos + 3 + 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v1 truncated (hdr)"); return false; }
         uint8_t mode     = p[pos++];
         uint8_t level    = p[pos++];
         uint8_t strategy = p[pos++];
         uint32_t n_idat  = rd_le32(p + pos); pos += 4;
+        // Each idat size is 4 bytes; cap n_idat by remaining file size.
+        if ((uint64_t)n_idat * 4 > sz - pos) {
+            snprintf(errormessage, MSG_SIZE, "PPG v1 truncated (idat sizes)"); return false;
+        }
         std::vector<uint32_t> isizes(n_idat);
         for (uint32_t i = 0; i < n_idat; i++) { isizes[i] = rd_le32(p + pos); pos += 4; }
+        if (pos + 8 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v1 truncated (pre_sz)"); return false; }
         uint64_t pre_sz = rd_le64(p + pos); pos += 8;
+        if (pre_sz > sz - pos) { snprintf(errormessage, MSG_SIZE, "PPG v1 truncated (pre)"); return false; }
         std::vector<uint8_t> pre(p + pos, p + pos + pre_sz); pos += pre_sz;
+        if (pos + 8 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v1 truncated (suf_sz)"); return false; }
         uint64_t suf_sz = rd_le64(p + pos); pos += 8;
+        if (suf_sz > sz - pos) { snprintf(errormessage, MSG_SIZE, "PPG v1 truncated (suf)"); return false; }
         std::vector<uint8_t> suf(p + pos, p + pos + suf_sz); pos += suf_sz;
+        if (pos + 16 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v1 truncated (sz hdr)"); return false; }
         uint64_t raw_sz  = rd_le64(p + pos); pos += 8;
         uint64_t lzma_sz = rd_le64(p + pos); pos += 8;
+        if (lzma_sz > sz - pos) {
+            snprintf(errormessage, MSG_SIZE, "PPG v1 truncated (lzma payload)"); return false;
+        }
         std::vector<uint8_t> payload;
         if (!lzma_dec(p + pos, lzma_sz, payload, raw_sz)) return false;
         std::vector<uint8_t> deflate_stream;
@@ -1299,6 +1326,12 @@ static bool decompress_ppg(const std::vector<uint8_t>& ppg_buf,
         std::vector<uint8_t> post(p + pos, p + pos + post_sz); pos += post_sz;
         uint32_t num_frames = rd_le32(p + pos); pos += 4;
         (void)is_apng;
+        // Audit fix #2: cap num_frames by remaining file size (each frame meta has at least
+        // 1 byte uses_idat + 5 bytes deflate params + 4 bytes nc + 16 bytes szs = 26 min).
+        // Use 20 as conservative lower bound on per-frame meta footprint.
+        if (num_frames > (sz - pos) / 20 + 1) {
+            snprintf(errormessage, MSG_SIZE, "PPG v2 num_frames implausible (%u)", num_frames); return false;
+        }
 
         std::vector<FrameMeta> frames(num_frames);
         for (uint32_t i = 0; i < num_frames; i++)
@@ -1345,20 +1378,44 @@ static bool compare_png_pixels(const std::vector<uint8_t>& a,
 /* ─── file helpers ───────────────────────────────────────────────────────── */
 
 static std::vector<uint8_t> read_file(const std::string& path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto sz = fs::file_size(path, ec);
+    if (ec || sz == 0) return {};
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return {};
-    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-    if (sz <= 0) { fclose(f); return {}; }
-    std::vector<uint8_t> buf(sz);
-    fread(buf.data(), 1, sz, f); fclose(f);
+    std::vector<uint8_t> buf((size_t)sz);
+    size_t got = fread(buf.data(), 1, buf.size(), f);
+    fclose(f);
+    // Audit fix #6: partial read = corrupt file, refuse to process garbage tail.
+    if (got != buf.size()) return {};
     return buf;
 }
 
 static bool write_file(const std::string& path, const std::vector<uint8_t>& data) {
-    FILE* f = fopen(path.c_str(), "wb");
+    // Audit fix #5: atomic .tmp + rename. Prevents losing the original file
+    // when the encoder errors mid-stream (disk full, ctrl+c, fwrite failure).
+    namespace fs = std::filesystem;
+    std::string tmp = path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
     if (!f) return false;
     bool ok = fwrite(data.data(), 1, data.size(), f) == data.size();
-    fclose(f); return ok;
+    if (fflush(f) != 0) ok = false;
+    if (fclose(f) != 0) ok = false;
+    if (!ok) {
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        return false;
+    }
+    std::error_code ec;
+    fs::rename(tmp, path, ec);
+    if (ec) {
+        // Some Windows filesystems error rename-over-existing — fall back to remove+rename.
+        fs::remove(path, ec);
+        fs::rename(tmp, path, ec);
+        if (ec) { fs::remove(tmp, ec); return false; }
+    }
+    return true;
 }
 
 enum FileType { F_PNG, F_PPG, F_UNK };
@@ -1441,12 +1498,31 @@ static void finish_bar() {
     fflush(stdout);
 }
 
+// Audit fix #8: keep the progress bar advancing even for files that are skipped
+// (wrong type, output exists, error, etc.). Caller must hold g_print_mutex.
+static inline void tick_bar() {
+    int done = g_files_done.fetch_add(1, std::memory_order_relaxed) + 1;
+    draw_bar(done);
+}
+
 static void process_file(const std::string& inpath) {
     namespace fs = std::filesystem;
     FileType ft = detect_type(inpath);
-    if (ft == F_UNK) return;
-    if (ft == F_PNG && decompress_only) return;
-    if (ft == F_PPG && compress_only)   return;
+    if (ft == F_UNK) {
+        std::lock_guard<std::mutex> lk(g_print_mutex);
+        tick_bar();
+        return;
+    }
+    if (ft == F_PNG && decompress_only) {
+        std::lock_guard<std::mutex> lk(g_print_mutex);
+        tick_bar();
+        return;
+    }
+    if (ft == F_PPG && compress_only) {
+        std::lock_guard<std::mutex> lk(g_print_mutex);
+        tick_bar();
+        return;
+    }
 
     bool do_compress = (ft == F_PNG);
     std::string ext     = do_compress ? ".ppg" : ".png";
@@ -1457,6 +1533,7 @@ static void process_file(const std::string& inpath) {
         clear_bar();
         fprintf(stderr, "%sERROR%s %s: output exists\n", col(RD), col(R), inpath.c_str());
         g_errors++;
+        tick_bar();
         return;
     }
 
@@ -1467,6 +1544,7 @@ static void process_file(const std::string& inpath) {
         clear_bar();
         fprintf(stderr, "%sERROR%s %s: cannot read\n", col(RD), col(R), inpath.c_str());
         g_errors++;
+        tick_bar();
         return;
     }
 
@@ -1477,6 +1555,7 @@ static void process_file(const std::string& inpath) {
         clear_bar();
         fprintf(stderr, "%sERROR%s %s: %s\n", col(RD), col(R), inpath.c_str(), errormessage);
         g_errors++;
+        tick_bar();
         return;
     }
 
@@ -1492,6 +1571,7 @@ static void process_file(const std::string& inpath) {
                 clear_bar();
                 fprintf(stderr, "%sERROR%s %s: round-trip mismatch\n", col(RD), col(R), inpath.c_str());
                 g_errors++;
+                tick_bar();
                 return;
             }
         } else {
@@ -1501,6 +1581,7 @@ static void process_file(const std::string& inpath) {
                 clear_bar();
                 fprintf(stderr, "%sERROR%s %s: round-trip mismatch\n", col(RD), col(R), inpath.c_str());
                 g_errors++;
+                tick_bar();
                 return;
             }
         }
@@ -1511,6 +1592,7 @@ static void process_file(const std::string& inpath) {
         clear_bar();
         fprintf(stderr, "%sERROR%s %s: cannot write output\n", col(RD), col(R), inpath.c_str());
         g_errors++;
+        tick_bar();
         return;
     }
 
@@ -1528,8 +1610,7 @@ static void process_file(const std::string& inpath) {
                     expanded ? " [incompressible — consider skipping]" : "");
         }
         g_processed++;
-        int done = g_files_done.fetch_add(1, std::memory_order_relaxed) + 1;
-        draw_bar(done);
+        tick_bar();
     }
     double prev = g_acc_in.load();
     while (!g_acc_in.compare_exchange_weak(prev, prev + (double)in_sz)) {}
@@ -1773,8 +1854,13 @@ int main(int argc, char** argv)
             outdir = arg.substr(3);
             std::filesystem::create_directories(outdir);
         }
-        else if (!arg.empty() && arg[0] == '-')
+        else if (!arg.empty() && arg[0] == '-') {
+            // Audit fix #10: abort on unknown flag (consistent with packJPG).
+            // Previously the warning was printed and the flag silently dropped,
+            // so typos like `-deeP` would be ignored without affecting behavior.
             fprintf(stderr, "unknown flag: %s\n", arg.c_str());
+            return 2;
+        }
         else
             collect(arg);
     }
