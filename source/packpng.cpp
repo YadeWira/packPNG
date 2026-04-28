@@ -87,6 +87,7 @@ static int  num_threads     = 1;
 static int  sfth_threads    = 1;
 static unsigned g_lzma_preset = 6u;
 static std::string outdir;
+static bool fs_mode = false;  // -fs: preserve source folder structure under -od when -r expands a dir
 
 static std::mutex g_print_mutex;
 
@@ -95,7 +96,12 @@ thread_local char errormessage[MSG_SIZE] = "no error";
 
 /* ─── file list ──────────────────────────────────────────────────────────── */
 
-static std::vector<std::string> filelist;
+struct CollectedFile {
+    std::string path;       // full path to the input file
+    std::string src_root;   // root the user passed on the CLI (for -fs structure preserve)
+                            //   empty when the file came from a direct path arg (no recurse)
+};
+static std::vector<CollectedFile> filelist;
 
 /* ─── accumulators (atomic for -th safety) ───────────────────────────────── */
 
@@ -1434,10 +1440,28 @@ static std::string replace_ext(const std::string& path, const std::string& ext) 
     return (dot == std::string::npos ? path : path.substr(0, dot)) + ext;
 }
 
-static std::string make_outpath(const std::string& inpath, const std::string& ext) {
+static std::string make_outpath(const std::string& inpath, const std::string& ext,
+                                const std::string& src_root) {
     namespace fs = std::filesystem;
     std::string base = replace_ext(fs::path(inpath).filename().string(), ext);
-    if (!outdir.empty()) return (fs::path(outdir) / base).string();
+    if (!outdir.empty()) {
+        // -fs: when the user expanded a directory with -r and asked to preserve
+        // structure, mirror the path's parent directory (relative to src_root)
+        // under outdir. e.g. -r -fs -odOUT TILIN with TILIN/sub/foo.png →
+        // OUT/sub/foo.png.ppg (TILIN's basename is stripped — caesium-clt's
+        // -RS semantics).
+        if (fs_mode && !src_root.empty()) {
+            std::error_code ec;
+            fs::path rel = fs::relative(fs::path(inpath).parent_path(),
+                                        fs::path(src_root), ec);
+            if (!ec && !rel.empty() && rel.string() != ".") {
+                fs::path full = fs::path(outdir) / rel / base;
+                fs::create_directories(full.parent_path(), ec);
+                return full.string();
+            }
+        }
+        return (fs::path(outdir) / base).string();
+    }
     return (fs::path(inpath).parent_path() / base).string();
 }
 
@@ -1505,7 +1529,7 @@ static inline void tick_bar() {
     draw_bar(done);
 }
 
-static void process_file(const std::string& inpath) {
+static void process_file(const std::string& inpath, const std::string& src_root = "") {
     namespace fs = std::filesystem;
     FileType ft = detect_type(inpath);
     if (ft == F_UNK) {
@@ -1526,7 +1550,7 @@ static void process_file(const std::string& inpath) {
 
     bool do_compress = (ft == F_PNG);
     std::string ext     = do_compress ? ".ppg" : ".png";
-    std::string outpath = make_outpath(inpath, ext);
+    std::string outpath = make_outpath(inpath, ext, src_root);
 
     if (!overwrite && fs::exists(outpath)) {
         std::lock_guard<std::mutex> lk(g_print_mutex);
@@ -1629,10 +1653,10 @@ static void collect(const std::string& path) {
             auto ext = e.path().extension().string();
             for (auto& ch : ext) ch = (char)tolower((unsigned char)ch);
             if (ext == ".png" || ext == ".apng" || ext == ".ppg")
-                filelist.push_back(e.path().string());
+                filelist.push_back({ e.path().string(), path });
         }
     } else {
-        filelist.push_back(path);
+        filelist.push_back({ path, std::string() });
     }
 }
 
@@ -1780,6 +1804,7 @@ static void show_help() {
         "  -o           overwrite existing output files\n"
         "  -p           proceed on warnings\n"
         "  -r           recurse into subdirectories\n"
+        "  -fs          preserve source folder structure under -od (use with -r)\n"
         "  -dry         dry run (no output files)\n"
         "  -m<1-9>      LZMA preset (default 6)\n"
         "  -me          LZMA extreme flag (slower, better ratio)\n"
@@ -1830,6 +1855,7 @@ int main(int argc, char** argv)
         else if (arg == "-o")         overwrite    = true;
         else if (arg == "-p")         err_tol      = 2;
         else if (arg == "-r")         recursive    = true;
+        else if (arg == "-fs")        fs_mode      = true;
         else if (arg == "-dry")       dry_run      = true;
         else if (arg == "-sfth")      sfth         = true;
         else if (arg == "-deep")      EARLYOUT_K   = 1 << 30;  // disable early-out → better ratio, ~2× time
@@ -1886,7 +1912,7 @@ int main(int argc, char** argv)
     }
 
     if (list_mode) {
-        for (auto& f : filelist) list_ppg(f);
+        for (auto& f : filelist) list_ppg(f.path);
         if (wait_exit && !module_mode) { fprintf(stdout, "\nPress <enter> to quit\n"); getchar(); }
         return 0;
     }
@@ -1897,7 +1923,7 @@ int main(int argc, char** argv)
     g_show_bar    = !module_mode && g_total_files > 1;
 
     if (num_threads <= 1) {
-        for (auto& f : filelist) process_file(f);
+        for (auto& f : filelist) process_file(f.path, f.src_root);
     } else {
         std::atomic<size_t> next_idx{0};
         std::vector<std::thread> workers;
@@ -1906,7 +1932,7 @@ int main(int argc, char** argv)
                 while (true) {
                     size_t i = next_idx.fetch_add(1);
                     if (i >= filelist.size()) break;
-                    process_file(filelist[i]);
+                    process_file(filelist[i].path, filelist[i].src_root);
                 }
             });
         }
