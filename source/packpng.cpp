@@ -52,10 +52,10 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "j";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "";   // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   ver_major  = 1;   // v1.0j — MT-LZMA in -thN -sfth batch mode (gated by hw_concurrency)
-static const int   ver_minor  = 0;
+static const int   ver_major  = 1;    // v1.1 — pre-stable audit: 10 bug fixes (DoS in PPG decoder, atomic write, safe read, MT consec_fails, progress bar, unknown flag)
+static const int   ver_minor  = 1;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
 
