@@ -1,6 +1,6 @@
 # packPNG
 
-**v1.0 — stable release.** Lossless PNG/APNG recompressor. Stores images in `.ppg` format using brute-force zlib parameter matching + solid LZMA (or Zstd) compression.
+**v1.1 — stable release.** Lossless PNG/APNG recompressor. Stores images in `.ppg` format using brute-force zlib parameter matching + solid LZMA (or Zstd) compression.
 
 The `.ppg` container format (versions v3–v7) is now stable. Future v1.x releases will keep all existing `.ppg` files decodable.
 
