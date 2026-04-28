@@ -1,4 +1,4 @@
-/* packPNG v1.0i - PNG/APNG lossless recompressor
+/* packPNG v1.0j - PNG/APNG lossless recompressor
  *
  * Per-frame algorithm:
  *   PNG/APNG → parse frames → inflate pixels → brute-force zlib re-encode
@@ -52,9 +52,9 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "i";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "j";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   ver_major  = 1;   // v1.0i — lazy -sfth: try cand 0 serially, only MT for rest
+static const int   ver_major  = 1;   // v1.0j — MT-LZMA in -thN -sfth batch mode (gated by hw_concurrency)
 static const int   ver_minor  = 0;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
@@ -664,11 +664,16 @@ static bool lzma_enc(const uint8_t* in, size_t insz, std::vector<uint8_t>& out) 
         { LZMA_VLI_UNKNOWN,  nullptr }
     };
 
-    // MT-LZMA path: enabled in single-file mode (num_threads <= 1) with -sfth.
-    // In batch mode (-thN with N>1) file-level parallelism already saturates the
-    // CPU, so MT-LZMA would oversubscribe. Block size 256K gives ~2.7× speedup
-    // for single big files at ~0.8% ratio cost (xz stream stays standard-readable).
-    if (sfth_threads > 1 && num_threads <= 1) {
+    // MT-LZMA path: enabled whenever -sfth is set and the total compute thread
+    // count (num_threads × sfth_threads) does NOT exceed hardware_concurrency.
+    // In single-file mode (1 × 4 = 4) always on. In batch (-thN -sfth) on as
+    // long as N×4 ≤ hw. With -th0 -sfth on a hw-thread machine, hw×4 > hw → OFF
+    // (avoids the 144-thread oversubscription on a 36-thread Xeon).
+    // Block size 256K: ~2.7× single-file speedup, ~0.8% ratio cost on big files
+    // (small files fit in 1 block → no penalty, no benefit either).
+    int _hw     = (int)std::thread::hardware_concurrency();
+    int _total  = std::max(1, num_threads) * sfth_threads;
+    if (sfth_threads > 1 && (_hw <= 0 || _total <= _hw)) {
         lzma_mt mt_opts = {};
         mt_opts.flags      = 0;
         mt_opts.threads    = (uint32_t)sfth_threads;
