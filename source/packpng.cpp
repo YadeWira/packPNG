@@ -1800,6 +1800,7 @@ static void show_help() {
 
 /* ─── main ───────────────────────────────────────────────────────────────── */
 
+#ifndef BUILD_LIB
 int main(int argc, char** argv)
 {
 #ifdef _WIN32
@@ -1935,3 +1936,4 @@ int main(int argc, char** argv)
     if (wait_exit && !module_mode) { fprintf(stdout, "\nPress <enter> to quit\n"); getchar(); }
     return errs ? 1 : 0;
 }
+#endif // !BUILD_LIB
