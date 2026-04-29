@@ -96,8 +96,9 @@ static bool use_fl2         = false;  // -fl2: solid fast-lzma2 block (LZMA2-str
 [[maybe_unused]]
 static int  g_fl2_level     = 10;     // FL2 max compression level (10) — referenced only under USE_FL2
 static bool use_kanzi       = false;  // -kanzi: solid kanzi BWT+CM block (better ratio than xz at faster encode, slow decomp)
+static bool use_kpng        = false;  // -kpng: PNG-tuned kanzi pipeline (LZP+BWT / CM) — drops TEXT+UTF dead weight
 [[maybe_unused]]
-static int  g_kanzi_level   = 7;      // kanzi level 7 (LZP+TEXT+UTF+BWT+LZP / CM): Pareto-optimal -0.65% size, -19% time vs xz-m6
+static int  g_kanzi_level   = 7;      // kanzi level 7 (LZP+TEXT+UTF+BWT+LZP / CM): generic Pareto-optimal vs xz-m6
 static int  verbosity       = 0;
 static int  num_threads     = 1;
 static int  sfth_threads    = 1;
@@ -884,7 +885,16 @@ static void kanzi_level_params(int level, std::string& transform, std::string& e
 static bool kanzi_enc(const uint8_t* in, size_t insz, std::vector<uint8_t>& out) {
     int jobs = sfth_threads > 1 ? sfth_threads : 1;
     std::string transform, entropy;
-    kanzi_level_params(g_kanzi_level, transform, entropy);
+    if (use_kpng) {
+        // kpng: PNG-tuned kanzi pipeline. Drops TEXT+UTF+DNA+EXE detectors that
+        // never match PNG pixel/idat data and only add per-block overhead. Drops
+        // the trailing LZP that hurts on smooth gradients. Empirically the best
+        // ratio on this corpus among ~25 transform combinations tested.
+        transform = "LZP+BWT";
+        entropy   = "CM";
+    } else {
+        kanzi_level_params(g_kanzi_level, transform, entropy);
+    }
     try {
         std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
         kanzi::CompressedOutputStream cos(ss, jobs, entropy, transform, 4 * 1024 * 1024);
@@ -1978,8 +1988,9 @@ static void show_help() {
         "  -deep        disable brute-force early-out (~2x slower, ~6%% smaller)\n"
         "  -ldf         libdeflate pixel-exact fallback for unmatched frames (PPG v5)\n"
         "  -fl2         fast-lzma2 backend (PPG v8/v9, ~2-4x faster, +1-2%% size)\n"
-        "  -kanzi       kanzi BWT+CM backend (PPG v10/v11, default level 7: ~0.6%% smaller, ~20%% faster than xz; slow decomp)\n"
-        "  -kanzi<1-9>  kanzi with explicit level (5=fast/balanced, 7=Pareto sweet spot, 9=TPAQX max ratio)\n"
+        "  -kanzi       kanzi BWT+CM backend (PPG v10/v11, default level 7; slow decomp)\n"
+        "  -kanzi<1-9>  kanzi with explicit level (5=balanced, 7=generic sweet spot, 9=TPAQX max ratio)\n"
+        "  -kpng        PNG-tuned kanzi pipeline (LZP+BWT / CM) — best ratio for PNG data; same v10/v11 format\n"
         "  -th<N>       N file-level threads (0=auto)\n"
         "  -sfth        parallel brute-force + MT-LZMA within each file (4 threads, single-file mode; -th<N/4> for batch)\n"
         "  -od<path>    write output to directory\n"
@@ -2039,6 +2050,7 @@ int main(int argc, char** argv)
             use_kanzi = true;
             g_kanzi_level = arg[6] - '0';
         }
+        else if (arg == "-kpng")      { use_kanzi = true; use_kpng = true; }
         else if (arg == "--no-color") no_color     = true;
         else if (arg == "-module")  { module_mode = true; wait_exit = false; }
         else if (arg.size() > 4 && arg.substr(0,4) == "-zl=") {
