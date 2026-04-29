@@ -39,6 +39,10 @@
 #  include <zstd.h>
 #endif
 
+#ifdef USE_FL2
+#  include <fast-lzma2.h>
+#endif
+
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
@@ -52,10 +56,10 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "a";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "";   // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   ver_major  = 1;    // v1.1 — pre-stable audit: 10 bug fixes (DoS in PPG decoder, atomic write, safe read, MT consec_fails, progress bar, unknown flag)
-static const int   ver_minor  = 1;
+static const int   ver_major  = 1;    // v1.2 — opt-in fast-lzma2 backend (-fl2): PPG v8/v9
+static const int   ver_minor  = 2;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
 
@@ -82,6 +86,8 @@ static bool lzma_extreme    = false;
 static bool ldf_repack      = false;  // -ldf: pixel-exact libdeflate fallback for unmatched frames
 static bool use_zstd        = false;  // -zstd: solid Zstd block instead of LZMA
 static int  g_zstd_level    = 19;
+static bool use_fl2         = false;  // -fl2: solid fast-lzma2 block (LZMA2-stream, ~2-4x faster, +1-2% size)
+static int  g_fl2_level     = 10;     // FL2 max compression level (10)
 static int  verbosity       = 0;
 static int  num_threads     = 1;
 static int  sfth_threads    = 1;
@@ -784,6 +790,48 @@ static bool zstd_dec(const uint8_t*, size_t, std::vector<uint8_t>&, size_t) {
 }
 #endif
 
+/* ─── fast-lzma2 compress / decompress ───────────────────────────────────── */
+
+#ifdef USE_FL2
+// FL2 produces a raw LZMA2 stream. Tuned to mirror the xz path's lc=4/pb=2
+// image-friendly Markov model. MT threads come from sfth_threads.
+static bool fl2_enc(const uint8_t* in, size_t insz, std::vector<uint8_t>& out) {
+    int threads = sfth_threads > 1 ? sfth_threads : 1;
+    FL2_CCtx* ctx = (threads > 1) ? FL2_createCCtxMt((unsigned)threads) : FL2_createCCtx();
+    if (!ctx) { snprintf(errormessage, MSG_SIZE, "FL2 ctx alloc failed"); return false; }
+    FL2_CCtx_setParameter(ctx, FL2_p_compressionLevel, g_fl2_level);
+    FL2_CCtx_setParameter(ctx, FL2_p_highCompression, 1);
+    FL2_CCtx_setParameter(ctx, FL2_p_literalCtxBits, 4);
+    FL2_CCtx_setParameter(ctx, FL2_p_literalPosBits, 0);
+    FL2_CCtx_setParameter(ctx, FL2_p_posBits, 2);
+    FL2_CCtx_setParameter(ctx, FL2_p_searchDepth, 254);
+    size_t bound = FL2_compressBound(insz);
+    out.resize(bound);
+    size_t r = FL2_compressCCtx(ctx, out.data(), bound, in, insz, g_fl2_level);
+    FL2_freeCCtx(ctx);
+    if (FL2_isError(r)) {
+        snprintf(errormessage, MSG_SIZE, "FL2 encode: %s", FL2_getErrorName(r)); return false;
+    }
+    out.resize(r); return true;
+}
+static bool fl2_dec(const uint8_t* in, size_t insz,
+                    std::vector<uint8_t>& out, size_t expected) {
+    out.resize(expected);
+    size_t r = FL2_decompress(out.data(), expected, in, insz);
+    if (FL2_isError(r)) {
+        snprintf(errormessage, MSG_SIZE, "FL2 decode: %s", FL2_getErrorName(r)); return false;
+    }
+    out.resize(r); return true;
+}
+#else
+static bool fl2_enc(const uint8_t*, size_t, std::vector<uint8_t>&) {
+    snprintf(errormessage, MSG_SIZE, "not compiled with USE_FL2 (-DUSE_FL2 -lfast-lzma2)"); return false;
+}
+static bool fl2_dec(const uint8_t*, size_t, std::vector<uint8_t>&, size_t) {
+    snprintf(errormessage, MSG_SIZE, "not compiled with USE_FL2 (-DUSE_FL2 -lfast-lzma2)"); return false;
+}
+#endif
+
 /* ─── compress PNG/APNG → PPG v4 (solid LZMA + filter separation) ───────── */
 
 struct FrameEnc {
@@ -893,8 +941,10 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
     for (auto& fe : enc) if (fe.ldf_mode) { has_mode2 = true; break; }
 
     std::vector<uint8_t> comp_data;
-    const char* comp_label = use_zstd ? "Zstd" : "LZMA";
-    if (use_zstd) {
+    const char* comp_label = use_fl2 ? "FL2" : (use_zstd ? "Zstd" : "LZMA");
+    if (use_fl2) {
+        if (!fl2_enc(combined.data(), combined.size(), comp_data)) return false;
+    } else if (use_zstd) {
         if (!zstd_enc(combined.data(), combined.size(), comp_data)) return false;
     } else {
         if (!lzma_enc(combined.data(), combined.size(), comp_data)) return false;
@@ -908,8 +958,11 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
                 total_payload > 0 ? 100.0 * comp_data.size() / total_payload : 0.0);
     }
 
-    // v4/v5 = LZMA; v6/v7 = Zstd (same layout, different compressor)
-    uint8_t fmt_ver = use_zstd ? (has_mode2 ? 7u : 6u) : (has_mode2 ? 5u : 4u);
+    // v4/v5 = LZMA; v6/v7 = Zstd; v8/v9 = fast-lzma2 (same layout, different compressor)
+    uint8_t fmt_ver;
+    if (use_fl2)        fmt_ver = has_mode2 ? 9u : 8u;
+    else if (use_zstd)  fmt_ver = has_mode2 ? 7u : 6u;
+    else                fmt_ver = has_mode2 ? 5u : 4u;
 
     ppg_out.clear();
     wr_bytes(ppg_out, PPG_SIG, 4);
@@ -1225,7 +1278,9 @@ static bool decompress_solid(const uint8_t* p, size_t sz, size_t pos,
     uint64_t comp_sz   = rd_le64(p + pos); pos += 8;
     if (pos + comp_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG solid truncated (comp data)"); return false; }
     std::vector<uint8_t> combined;
-    if (ppg_version >= 6) {
+    if (ppg_version >= 8) {
+        if (!fl2_dec(p + pos, comp_sz, combined, total_raw)) return false;
+    } else if (ppg_version >= 6) {
         if (!zstd_dec(p + pos, comp_sz, combined, total_raw)) return false;
     } else {
         if (!lzma_dec(p + pos, comp_sz, combined, total_raw)) return false;
@@ -1360,7 +1415,7 @@ static bool decompress_ppg(const std::vector<uint8_t>& ppg_buf,
         return true;
     }
 
-    if (version >= 3 && version <= 7)
+    if (version >= 3 && version <= 9)
         return decompress_solid(p, sz, pos, version, png_out);
 
     snprintf(errormessage, MSG_SIZE, "unknown PPG version %u", version); return false;
@@ -1725,16 +1780,17 @@ static void list_ppg(const std::string& path) {
         return;
     }
 
-    if (version >= 3 && version <= 7) {
+    if (version >= 3 && version <= 9) {
         bool is_apng   = (buf[pos++] & 1) != 0;
         uint32_t plays = rd_le32(buf.data()+pos); pos+=4;
         uint64_t pre_sz=rd_le64(buf.data()+pos); pos+=8; pos+=pre_sz;
         uint64_t post_sz=rd_le64(buf.data()+pos); pos+=8; pos+=post_sz;
         uint32_t nf   = rd_le32(buf.data()+pos); pos+=4;
-        const char* compressor = (version >= 6) ? "Zstd" : "LZMA";
+        const char* compressor = (version >= 8) ? "FL2" :
+                                 (version >= 6) ? "Zstd" : "LZMA";
         const char* fmtdesc = (version == 3) ? "" :
-                              (version == 4 || version == 6) ? " + filter sep" :
-                                                               " + filter sep + ldf-repack";
+                              (version == 4 || version == 6 || version == 8) ? " + filter sep" :
+                                                                                " + filter sep + ldf-repack";
         fprintf(stdout, "  PPG v%u  %s  %u frame(s)%s  [solid %s%s]\n",
                 version, is_apng?"APNG":"PNG", nf,
                 is_apng ? (" loops=" + std::to_string(plays)).c_str() : "",
@@ -1775,7 +1831,7 @@ static void list_ppg(const std::string& path) {
             uint64_t total_raw=rd_le64(buf.data()+pos); pos+=8;
             uint64_t comp_sz  =rd_le64(buf.data()+pos);
             fprintf(stdout, "  Solid %s: %llu → %llu (%.1f%%)\n",
-                    (version >= 6) ? "Zstd" : "LZMA",
+                    (version >= 8) ? "FL2" : (version >= 6) ? "Zstd" : "LZMA",
                     (unsigned long long)total_raw, (unsigned long long)comp_sz,
                     total_raw > 0 ? 100.0*comp_sz/total_raw : 0.0);
         }
@@ -1810,6 +1866,7 @@ static void show_help() {
         "  -me          LZMA extreme flag (slower, better ratio)\n"
         "  -deep        disable brute-force early-out (~2x slower, ~6%% smaller)\n"
         "  -ldf         libdeflate pixel-exact fallback for unmatched frames (PPG v5)\n"
+        "  -fl2         fast-lzma2 backend (PPG v8/v9, ~2-4x faster, +1-2%% size)\n"
         "  -th<N>       N file-level threads (0=auto)\n"
         "  -sfth        parallel brute-force + MT-LZMA within each file (4 threads, single-file mode; -th<N/4> for batch)\n"
         "  -od<path>    write output to directory\n"
@@ -1862,6 +1919,7 @@ int main(int argc, char** argv)
         else if (arg == "-me")        lzma_extreme = true;
         else if (arg == "-ldf")       ldf_repack   = true;
         else if (arg == "-zstd")      use_zstd     = true;
+        else if (arg == "-fl2")       use_fl2      = true;
         else if (arg == "--no-color") no_color     = true;
         else if (arg == "-module")  { module_mode = true; wait_exit = false; }
         else if (arg.size() > 4 && arg.substr(0,4) == "-zl=") {
@@ -1902,6 +1960,13 @@ int main(int argc, char** argv)
         if (!module_mode && hw < 4) {
             fprintf(stderr, "Warning: -sfth works best with 4+ cores (detected: %d)\n", hw);
         }
+    }
+
+    if (use_fl2 && use_zstd) {
+        if (!module_mode) {
+            fprintf(stderr, "Warning: -fl2 and -zstd are mutually exclusive; using -fl2.\n");
+        }
+        use_zstd = false;
     }
 
     if (filelist.empty()) { show_help(); return 0; }

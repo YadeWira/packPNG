@@ -6,6 +6,12 @@ LIBS       = -lz -llzma
 LIBS_LDF   = -lz -llzma -ldeflate
 LIBS_ZSTD  = -lz -llzma -lzstd
 
+# fast-lzma2 is not in apt; build from https://github.com/conor42/fast-lzma2
+# and set FL2_DIR to its source dir (containing libfast-lzma2.a + fast-lzma2.h).
+FL2_DIR   ?= /home/forum/git/Otros/fast-lzma2
+LIBS_FL2   = -lz -llzma $(FL2_DIR)/libfast-lzma2.a -lpthread
+INC_FL2    = -I$(FL2_DIR)
+
 TARGET     = packPNG
 SRC        = packpng.cpp
 
@@ -28,7 +34,7 @@ MINGW_LIBS   = -static \
                -lstdc++ -lgcc -lgcc_eh -lws2_32
 WIN_TARGET   = packPNG.exe
 
-.PHONY: all ldf zstd clean asan win
+.PHONY: all ldf zstd fl2 clean asan win
 
 all: $(TARGET)
 
@@ -42,6 +48,10 @@ ldf: $(SRC)
 # Build with Zstd support (-zstd flag, solid Zstd block instead of LZMA)
 zstd: $(SRC)
 	$(CXX) $(CXXFLAGS) -DUSE_ZSTD -o $(TARGET) $^ $(LIBS_ZSTD)
+
+# Build with fast-lzma2 support (-fl2 flag, ~2-4x faster encode at +1-2% size)
+fl2: $(SRC)
+	$(CXX) $(CXXFLAGS) -DUSE_FL2 $(INC_FL2) -o $(TARGET) $^ $(LIBS_FL2)
 
 asan: $(SRC)
 	$(CXX) $(CXXFLAGS) -fsanitize=address,undefined -g -o $(TARGET)_asan $^ $(LIBS)
