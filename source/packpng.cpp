@@ -56,9 +56,9 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "";   // letra = bugfix-only; sin letra = feature
+static const char* subversion = "a";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   ver_major  = 1;    // v1.2 — opt-in fast-lzma2 backend (-fl2): PPG v8/v9
+static const int   ver_major  = 1;    // v1.2a — fused-probe brute-force (-2.2% corpus, ratio invariant)
 static const int   ver_minor  = 2;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
