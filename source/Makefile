@@ -12,6 +12,12 @@ FL2_DIR   ?= /home/forum/git/Otros/fast-lzma2
 LIBS_FL2   = -lz -llzma $(FL2_DIR)/libfast-lzma2.a -lpthread
 INC_FL2    = -I$(FL2_DIR)
 
+# kanzi-cpp is not in apt; build from https://github.com/flanglet/kanzi-cpp
+# and set KANZI_DIR to its repo root (we use $(KANZI_DIR)/build/libkanzi.a).
+KANZI_DIR ?= /home/forum/git/Otros/kanzi-cpp
+LIBS_KANZI = -lz -llzma $(KANZI_DIR)/build/libkanzi.a -lpthread
+INC_KANZI  = -I$(KANZI_DIR)/src
+
 TARGET     = packPNG
 SRC        = packpng.cpp
 
@@ -34,7 +40,7 @@ MINGW_LIBS   = -static \
                -lstdc++ -lgcc -lgcc_eh -lws2_32
 WIN_TARGET   = packPNG.exe
 
-.PHONY: all ldf zstd fl2 clean asan win
+.PHONY: all ldf zstd fl2 kanzi clean asan win
 
 all: $(TARGET)
 
@@ -52,6 +58,10 @@ zstd: $(SRC)
 # Build with fast-lzma2 support (-fl2 flag, ~2-4x faster encode at +1-2% size)
 fl2: $(SRC)
 	$(CXX) $(CXXFLAGS) -DUSE_FL2 $(INC_FL2) -o $(TARGET) $^ $(LIBS_FL2)
+
+# Build with kanzi support (-kanzi flag, BWT+CM, beats xz ratio at faster comp; slow decomp)
+kanzi: $(SRC)
+	$(CXX) $(CXXFLAGS) -DUSE_KANZI $(INC_KANZI) -o $(TARGET) $^ $(LIBS_KANZI)
 
 asan: $(SRC)
 	$(CXX) $(CXXFLAGS) -fsanitize=address,undefined -g -o $(TARGET)_asan $^ $(LIBS)

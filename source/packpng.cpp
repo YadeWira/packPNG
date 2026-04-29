@@ -43,6 +43,12 @@
 #  include <fast-lzma2.h>
 #endif
 
+#ifdef USE_KANZI
+#  include <sstream>
+#  include "io/CompressedOutputStream.hpp"
+#  include "io/CompressedInputStream.hpp"
+#endif
+
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
@@ -56,10 +62,10 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "a";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "";   // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   ver_major  = 1;    // v1.2a — fused-probe brute-force (-2.2% corpus, ratio invariant)
-static const int   ver_minor  = 2;
+static const int   ver_major  = 1;    // v1.3 — opt-in kanzi backend (-kanzi): PPG v10/v11
+static const int   ver_minor  = 3;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
 
@@ -89,6 +95,9 @@ static int  g_zstd_level    = 19;
 static bool use_fl2         = false;  // -fl2: solid fast-lzma2 block (LZMA2-stream, ~2-4x faster, +1-2% size)
 [[maybe_unused]]
 static int  g_fl2_level     = 10;     // FL2 max compression level (10) — referenced only under USE_FL2
+static bool use_kanzi       = false;  // -kanzi: solid kanzi BWT+CM block (better ratio than xz at faster encode, slow decomp)
+[[maybe_unused]]
+static int  g_kanzi_level   = 7;      // kanzi level 7 (LZP+TEXT+UTF+BWT+LZP / CM): Pareto-optimal -0.65% size, -19% time vs xz-m6
 static int  verbosity       = 0;
 static int  num_threads     = 1;
 static int  sfth_threads    = 1;
@@ -852,6 +861,80 @@ static bool fl2_dec(const uint8_t*, size_t, std::vector<uint8_t>&, size_t) {
 }
 #endif
 
+/* ─── kanzi (BWT + CM/ANS) compress / decompress ─────────────────────────── */
+
+#ifdef USE_KANZI
+// Kanzi level → transform/entropy mapping (mirrors BlockCompressor::getTransformAndCodec).
+static void kanzi_level_params(int level, std::string& transform, std::string& entropy) {
+    switch (level) {
+        case 0: transform="NONE";                          entropy="NONE";    break;
+        case 1: transform="LZX";                           entropy="NONE";    break;
+        case 2: transform="DNA+LZ";                        entropy="HUFFMAN"; break;
+        case 3: transform="TEXT+UTF+PACK+MM+LZX";          entropy="HUFFMAN"; break;
+        case 4: transform="TEXT+UTF+EXE+PACK+MM+ROLZ";     entropy="NONE";    break;
+        case 5: transform="TEXT+UTF+BWT+RANK+ZRLT";        entropy="ANS0";    break;
+        case 6: transform="TEXT+UTF+BWT+SRT+ZRLT";         entropy="FPAQ";    break;
+        case 7: transform="LZP+TEXT+UTF+BWT+LZP";          entropy="CM";      break;
+        case 8: transform="EXE+RLT+TEXT+UTF+DNA";          entropy="TPAQ";    break;
+        case 9: transform="EXE+RLT+TEXT+UTF+DNA";          entropy="TPAQX";   break;
+        default:transform="TEXT+UTF+BWT+RANK+ZRLT";        entropy="ANS0";    break;
+    }
+}
+
+static bool kanzi_enc(const uint8_t* in, size_t insz, std::vector<uint8_t>& out) {
+    int jobs = sfth_threads > 1 ? sfth_threads : 1;
+    std::string transform, entropy;
+    kanzi_level_params(g_kanzi_level, transform, entropy);
+    try {
+        std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+        kanzi::CompressedOutputStream cos(ss, jobs, entropy, transform, 4 * 1024 * 1024);
+        cos.write((const char*)in, (std::streamsize)insz);
+        cos.close();
+        std::string s = ss.str();
+        out.assign(s.begin(), s.end());
+        return true;
+    } catch (const std::exception& e) {
+        snprintf(errormessage, MSG_SIZE, "Kanzi encode: %s", e.what());
+        return false;
+    }
+}
+
+static bool kanzi_dec(const uint8_t* in, size_t insz,
+                      std::vector<uint8_t>& out, size_t expected) {
+    try {
+        std::stringstream ss(std::string((const char*)in, insz),
+                             std::ios::in | std::ios::out | std::ios::binary);
+        kanzi::CompressedInputStream cis(ss, 1);
+        out.resize(expected);
+        size_t total_read = 0;
+        while (total_read < expected) {
+            cis.read((char*)out.data() + total_read,
+                     (std::streamsize)(expected - total_read));
+            std::streamsize got = cis.gcount();
+            if (got <= 0) break;
+            total_read += (size_t)got;
+        }
+        cis.close();
+        if (total_read != expected) {
+            snprintf(errormessage, MSG_SIZE,
+                     "Kanzi decode: read %zu of %zu", total_read, expected);
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        snprintf(errormessage, MSG_SIZE, "Kanzi decode: %s", e.what());
+        return false;
+    }
+}
+#else
+static bool kanzi_enc(const uint8_t*, size_t, std::vector<uint8_t>&) {
+    snprintf(errormessage, MSG_SIZE, "not compiled with USE_KANZI (-DUSE_KANZI -lkanzi)"); return false;
+}
+static bool kanzi_dec(const uint8_t*, size_t, std::vector<uint8_t>&, size_t) {
+    snprintf(errormessage, MSG_SIZE, "not compiled with USE_KANZI (-DUSE_KANZI -lkanzi)"); return false;
+}
+#endif
+
 /* ─── compress PNG/APNG → PPG v4 (solid LZMA + filter separation) ───────── */
 
 struct FrameEnc {
@@ -961,8 +1044,10 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
     for (auto& fe : enc) if (fe.ldf_mode) { has_mode2 = true; break; }
 
     std::vector<uint8_t> comp_data;
-    const char* comp_label = use_fl2 ? "FL2" : (use_zstd ? "Zstd" : "LZMA");
-    if (use_fl2) {
+    const char* comp_label = use_kanzi ? "Kanzi" : (use_fl2 ? "FL2" : (use_zstd ? "Zstd" : "LZMA"));
+    if (use_kanzi) {
+        if (!kanzi_enc(combined.data(), combined.size(), comp_data)) return false;
+    } else if (use_fl2) {
         if (!fl2_enc(combined.data(), combined.size(), comp_data)) return false;
     } else if (use_zstd) {
         if (!zstd_enc(combined.data(), combined.size(), comp_data)) return false;
@@ -978,11 +1063,12 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
                 total_payload > 0 ? 100.0 * comp_data.size() / total_payload : 0.0);
     }
 
-    // v4/v5 = LZMA; v6/v7 = Zstd; v8/v9 = fast-lzma2 (same layout, different compressor)
+    // v4/v5 = LZMA; v6/v7 = Zstd; v8/v9 = fast-lzma2; v10/v11 = kanzi
     uint8_t fmt_ver;
-    if (use_fl2)        fmt_ver = has_mode2 ? 9u : 8u;
-    else if (use_zstd)  fmt_ver = has_mode2 ? 7u : 6u;
-    else                fmt_ver = has_mode2 ? 5u : 4u;
+    if (use_kanzi)      fmt_ver = has_mode2 ? 11u : 10u;
+    else if (use_fl2)   fmt_ver = has_mode2 ? 9u  : 8u;
+    else if (use_zstd)  fmt_ver = has_mode2 ? 7u  : 6u;
+    else                fmt_ver = has_mode2 ? 5u  : 4u;
 
     ppg_out.clear();
     wr_bytes(ppg_out, PPG_SIG, 4);
@@ -1298,7 +1384,9 @@ static bool decompress_solid(const uint8_t* p, size_t sz, size_t pos,
     uint64_t comp_sz   = rd_le64(p + pos); pos += 8;
     if (pos + comp_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG solid truncated (comp data)"); return false; }
     std::vector<uint8_t> combined;
-    if (ppg_version >= 8) {
+    if (ppg_version >= 10) {
+        if (!kanzi_dec(p + pos, comp_sz, combined, total_raw)) return false;
+    } else if (ppg_version >= 8) {
         if (!fl2_dec(p + pos, comp_sz, combined, total_raw)) return false;
     } else if (ppg_version >= 6) {
         if (!zstd_dec(p + pos, comp_sz, combined, total_raw)) return false;
@@ -1435,7 +1523,7 @@ static bool decompress_ppg(const std::vector<uint8_t>& ppg_buf,
         return true;
     }
 
-    if (version >= 3 && version <= 9)
+    if (version >= 3 && version <= 11)
         return decompress_solid(p, sz, pos, version, png_out);
 
     snprintf(errormessage, MSG_SIZE, "unknown PPG version %u", version); return false;
@@ -1800,17 +1888,18 @@ static void list_ppg(const std::string& path) {
         return;
     }
 
-    if (version >= 3 && version <= 9) {
+    if (version >= 3 && version <= 11) {
         bool is_apng   = (buf[pos++] & 1) != 0;
         uint32_t plays = rd_le32(buf.data()+pos); pos+=4;
         uint64_t pre_sz=rd_le64(buf.data()+pos); pos+=8; pos+=pre_sz;
         uint64_t post_sz=rd_le64(buf.data()+pos); pos+=8; pos+=post_sz;
         uint32_t nf   = rd_le32(buf.data()+pos); pos+=4;
-        const char* compressor = (version >= 8) ? "FL2" :
-                                 (version >= 6) ? "Zstd" : "LZMA";
+        const char* compressor = (version >= 10) ? "Kanzi" :
+                                 (version >= 8)  ? "FL2"   :
+                                 (version >= 6)  ? "Zstd"  : "LZMA";
         const char* fmtdesc = (version == 3) ? "" :
-                              (version == 4 || version == 6 || version == 8) ? " + filter sep" :
-                                                                                " + filter sep + ldf-repack";
+                              (version == 4 || version == 6 || version == 8 || version == 10) ? " + filter sep" :
+                                                                                                  " + filter sep + ldf-repack";
         fprintf(stdout, "  PPG v%u  %s  %u frame(s)%s  [solid %s%s]\n",
                 version, is_apng?"APNG":"PNG", nf,
                 is_apng ? (" loops=" + std::to_string(plays)).c_str() : "",
@@ -1851,7 +1940,9 @@ static void list_ppg(const std::string& path) {
             uint64_t total_raw=rd_le64(buf.data()+pos); pos+=8;
             uint64_t comp_sz  =rd_le64(buf.data()+pos);
             fprintf(stdout, "  Solid %s: %llu → %llu (%.1f%%)\n",
-                    (version >= 8) ? "FL2" : (version >= 6) ? "Zstd" : "LZMA",
+                    (version >= 10) ? "Kanzi" :
+                    (version >= 8)  ? "FL2"   :
+                    (version >= 6)  ? "Zstd"  : "LZMA",
                     (unsigned long long)total_raw, (unsigned long long)comp_sz,
                     total_raw > 0 ? 100.0*comp_sz/total_raw : 0.0);
         }
@@ -1887,6 +1978,8 @@ static void show_help() {
         "  -deep        disable brute-force early-out (~2x slower, ~6%% smaller)\n"
         "  -ldf         libdeflate pixel-exact fallback for unmatched frames (PPG v5)\n"
         "  -fl2         fast-lzma2 backend (PPG v8/v9, ~2-4x faster, +1-2%% size)\n"
+        "  -kanzi       kanzi BWT+CM backend (PPG v10/v11, default level 7: ~0.6%% smaller, ~20%% faster than xz; slow decomp)\n"
+        "  -kanzi<1-9>  kanzi with explicit level (5=fast/balanced, 7=Pareto sweet spot, 9=TPAQX max ratio)\n"
         "  -th<N>       N file-level threads (0=auto)\n"
         "  -sfth        parallel brute-force + MT-LZMA within each file (4 threads, single-file mode; -th<N/4> for batch)\n"
         "  -od<path>    write output to directory\n"
@@ -1940,6 +2033,12 @@ int main(int argc, char** argv)
         else if (arg == "-ldf")       ldf_repack   = true;
         else if (arg == "-zstd")      use_zstd     = true;
         else if (arg == "-fl2")       use_fl2      = true;
+        else if (arg == "-kanzi")     use_kanzi    = true;
+        else if (arg.rfind("-kanzi", 0) == 0 && arg.size() == 7 &&
+                 arg[6] >= '1' && arg[6] <= '9') {
+            use_kanzi = true;
+            g_kanzi_level = arg[6] - '0';
+        }
         else if (arg == "--no-color") no_color     = true;
         else if (arg == "-module")  { module_mode = true; wait_exit = false; }
         else if (arg.size() > 4 && arg.substr(0,4) == "-zl=") {
@@ -1982,11 +2081,15 @@ int main(int argc, char** argv)
         }
     }
 
-    if (use_fl2 && use_zstd) {
-        if (!module_mode) {
-            fprintf(stderr, "Warning: -fl2 and -zstd are mutually exclusive; using -fl2.\n");
+    {
+        int n = (int)use_zstd + (int)use_fl2 + (int)use_kanzi;
+        if (n > 1) {
+            if (!module_mode) {
+                fprintf(stderr, "Warning: -kanzi, -fl2, -zstd are mutually exclusive; precedence kanzi > fl2 > zstd.\n");
+            }
+            if (use_kanzi)      { use_fl2 = false; use_zstd = false; }
+            else if (use_fl2)   { use_zstd = false; }
         }
-        use_zstd = false;
     }
 
     if (filelist.empty()) { show_help(); return 0; }
