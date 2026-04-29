@@ -65,7 +65,7 @@ static const int   ver_minor  = 2;
 
 static const uint8_t PNG_SIG[8] = {0x89,'P','N','G','\r','\n',0x1a,'\n'};
 static const uint8_t PPG_SIG[4] = {'P','P','G','1'};
-static const size_t  PROBE_BYTES    = 65536;
+static const size_t  PROBE_BYTES    = 256u << 10;  // 256 KiB — covers most PNG IDATs in one probe
 static const int     MSG_SIZE       = 512;
 static       int     EARLYOUT_K     = 8;   // bail after K consecutive probe failures (-deep raises it)
 static const int     MAX_FULL_CALLS = 20;  // cap on expensive full_deflate calls per IDAT
@@ -87,7 +87,8 @@ static bool ldf_repack      = false;  // -ldf: pixel-exact libdeflate fallback f
 static bool use_zstd        = false;  // -zstd: solid Zstd block instead of LZMA
 static int  g_zstd_level    = 19;
 static bool use_fl2         = false;  // -fl2: solid fast-lzma2 block (LZMA2-stream, ~2-4x faster, +1-2% size)
-static int  g_fl2_level     = 10;     // FL2 max compression level (10)
+[[maybe_unused]]
+static int  g_fl2_level     = 10;     // FL2 max compression level (10) — referenced only under USE_FL2
 static int  verbosity       = 0;
 static int  num_threads     = 1;
 static int  sfth_threads    = 1;
@@ -471,44 +472,50 @@ static bool parse_png(const std::vector<uint8_t>& buf, PngInfo& info) {
 
 struct DeflParams { int level, strategy, memlevel, wbits; };
 
-static bool probe_deflate(const uint8_t* px, size_t pxsz,
-                          const uint8_t* tgt, size_t tgtsz,
-                          int lv, int st, int wbits, int memlevel,
-                          std::vector<uint8_t>& tmp)
+// Probe result: 0 = no match, 1 = partial match (need full_deflate), 2 = complete match
+// (probe encoded the full stream and verified all bytes — caller skips full_deflate).
+static int probe_deflate(const uint8_t* px, size_t pxsz,
+                         const uint8_t* tgt, size_t tgtsz,
+                         int lv, int st, int wbits, int memlevel,
+                         std::vector<uint8_t>& tmp)
 {
-    // Phase 1 – quick pre-filter: 256 bytes
-    {
-        static const size_t QUICK = 256;
-        z_stream q{};
-        if (deflateInit2(&q, lv, Z_DEFLATED, wbits, memlevel, st) != Z_OK) return false;
-        uint8_t qbuf[QUICK + 8];
-        q.next_in   = const_cast<uint8_t*>(px);
-        q.avail_in  = (uInt)pxsz;
-        q.next_out  = qbuf;
-        q.avail_out = sizeof(qbuf);
-        deflate(&q, Z_FINISH);
-        size_t qlen = q.total_out;
-        deflateEnd(&q);
-        if (qlen >= 3) {
-            size_t cmp = std::min({qlen, tgtsz, QUICK});
-            if (memcmp(qbuf, tgt, cmp) != 0) return false;
-        }
-    }
-    // Phase 2 – full probe: PROBE_BYTES
+    static const size_t QUICK = 256;
     z_stream zs{};
-    if (deflateInit2(&zs, lv, Z_DEFLATED, wbits, memlevel, st) != Z_OK) return false;
+    if (deflateInit2(&zs, lv, Z_DEFLATED, wbits, memlevel, st) != Z_OK) return 0;
     tmp.resize(PROBE_BYTES + 128);
     zs.next_in   = const_cast<uint8_t*>(px);
     zs.avail_in  = (uInt)pxsz;
+
+    // Stage 1: produce up to QUICK bytes, bail on prefix mismatch (cheap reject).
     zs.next_out  = tmp.data();
-    zs.avail_out = (uInt)tmp.size();
-    deflate(&zs, Z_FINISH);
-    size_t olen = zs.total_out;
+    zs.avail_out = (uInt)QUICK;
+    int r = deflate(&zs, Z_FINISH);
+    size_t produced = (size_t)zs.total_out;
+    if (produced >= 3) {
+        size_t cmp = std::min(produced, std::min(tgtsz, QUICK));
+        if (memcmp(tmp.data(), tgt, cmp) != 0) { deflateEnd(&zs); return 0; }
+    }
+    bool finished = (r == Z_STREAM_END);
+
+    // Stage 2: continue producing up to PROBE_BYTES total (only if Z_FINISH didn't end yet).
+    if (!finished) {
+        zs.next_out  = tmp.data() + produced;
+        zs.avail_out = (uInt)(PROBE_BYTES - produced);
+        r = deflate(&zs, Z_FINISH);
+        produced = (size_t)zs.total_out;
+        finished = (r == Z_STREAM_END);
+    }
     deflateEnd(&zs);
-    if (olen == 0) return false;
-    size_t cmp = std::min({olen, tgtsz, PROBE_BYTES});
-    if (cmp == 0) return false;
-    return memcmp(tmp.data(), tgt, cmp) == 0;
+
+    if (produced == 0) return 0;
+    size_t cmp = std::min(produced, std::min(tgtsz, PROBE_BYTES));
+    if (cmp == 0) return 0;
+    if (memcmp(tmp.data(), tgt, cmp) != 0) return 0;
+
+    // If the full stream finished within our buffer AND its length equals tgtsz AND
+    // every byte we produced matches tgt — the candidate is fully verified.
+    if (finished && produced == tgtsz) return 2;
+    return 1;
 }
 
 static bool full_deflate(const std::vector<uint8_t>& px,
@@ -586,12 +593,16 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
         std::vector<uint8_t> tmp, attempt;
         int full_calls = 0, consec_fails = 0;
         for (auto& c : cands) {
-            if (!probe_deflate(px.data(), px.size(), tgt.data(), tgt.size(),
-                               c.lv, c.st, c.wbits, c.memlevel, tmp)) {
+            int rc = probe_deflate(px.data(), px.size(), tgt.data(), tgt.size(),
+                                   c.lv, c.st, c.wbits, c.memlevel, tmp);
+            if (rc == 0) {
                 if (++consec_fails >= EARLYOUT_K) break;  // exotic encoder — stop probing
                 continue;
             }
             consec_fails = 0;
+            if (rc == 2) {                                // probe verified entire stream
+                p = {c.lv, c.st, c.memlevel, c.wbits}; return true;
+            }
             if (++full_calls > MAX_FULL_CALLS) break;     // cap expensive false-positive sweeps
             if (full_deflate(px, tgt, c.lv, c.st, c.wbits, c.memlevel, attempt)) {
                 p = {c.lv, c.st, c.memlevel, c.wbits}; return true;
@@ -608,8 +619,11 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
     {
         std::vector<uint8_t> tmp, attempt;
         auto& c = cands[0];
-        if (probe_deflate(px.data(), px.size(), tgt.data(), tgt.size(),
-                          c.lv, c.st, c.wbits, c.memlevel, tmp)) {
+        int rc = probe_deflate(px.data(), px.size(), tgt.data(), tgt.size(),
+                               c.lv, c.st, c.wbits, c.memlevel, tmp);
+        if (rc == 2) {
+            p = {c.lv, c.st, c.memlevel, c.wbits}; return true;
+        } else if (rc == 1) {
             sched_full_calls = 1;
             if (full_deflate(px, tgt, c.lv, c.st, c.wbits, c.memlevel, attempt)) {
                 p = {c.lv, c.st, c.memlevel, c.wbits}; return true;
@@ -643,12 +657,18 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
                 int idx = next_cand.fetch_add(1);
                 if (idx >= (int)cands.size()) break;
                 auto& c = cands[idx];
-                if (!probe_deflate(px.data(), px.size(), tgt.data(), tgt.size(),
-                                   c.lv, c.st, c.wbits, c.memlevel, tmp)) {
+                int rc = probe_deflate(px.data(), px.size(), tgt.data(), tgt.size(),
+                                       c.lv, c.st, c.wbits, c.memlevel, tmp);
+                if (rc == 0) {
                     consec_fails.fetch_add(1, std::memory_order_relaxed);
                     continue;
                 }
                 consec_fails.store(0, std::memory_order_relaxed);
+                if (rc == 2) {                                  // probe already verified full stream
+                    std::lock_guard<std::mutex> lk(result_mu);
+                    if (!found) { result = {c.lv, c.st, c.memlevel, c.wbits}; found = true; }
+                    break;
+                }
                 if (full_calls.fetch_add(1, std::memory_order_relaxed) >= MAX_FULL_CALLS) break;
                 if (full_deflate(px, tgt, c.lv, c.st, c.wbits, c.memlevel, attempt)) {
                     std::lock_guard<std::mutex> lk(result_mu);
