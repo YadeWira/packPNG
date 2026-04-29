@@ -62,9 +62,9 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "";   // letra = bugfix-only; sin letra = feature
+static const char* subversion = "a";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   ver_major  = 1;    // v1.3 — opt-in kanzi backend (-kanzi): PPG v10/v11
+static const int   ver_major  = 1;    // v1.3a — kpng pipeline (LZP+BWT / CM): -0.72% size, -23% time vs xz-m6
 static const int   ver_minor  = 3;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
