@@ -62,10 +62,10 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "a";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "";   // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   ver_major  = 1;    // v1.3a — kpng pipeline (LZP+BWT / CM): -0.72% size, -23% time vs xz-m6
-static const int   ver_minor  = 3;
+static const int   ver_major  = 1;    // v1.4 — kpng v2 split-stream (PPG v12/v13): 4× faster decomp via FPAQ-idat
+static const int   ver_minor  = 4;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
 
@@ -882,19 +882,12 @@ static void kanzi_level_params(int level, std::string& transform, std::string& e
     }
 }
 
-static bool kanzi_enc(const uint8_t* in, size_t insz, std::vector<uint8_t>& out) {
+// Generic kanzi encode/decode with explicit pipeline. Used by both single-stream
+// (-kanzi, legacy -kpng v10/v11) and split-stream (-kpng v12/v13) paths.
+static bool kanzi_enc_pipe(const uint8_t* in, size_t insz,
+                           const std::string& transform, const std::string& entropy,
+                           std::vector<uint8_t>& out) {
     int jobs = sfth_threads > 1 ? sfth_threads : 1;
-    std::string transform, entropy;
-    if (use_kpng) {
-        // kpng: PNG-tuned kanzi pipeline. Drops TEXT+UTF+DNA+EXE detectors that
-        // never match PNG pixel/idat data and only add per-block overhead. Drops
-        // the trailing LZP that hurts on smooth gradients. Empirically the best
-        // ratio on this corpus among ~25 transform combinations tested.
-        transform = "LZP+BWT";
-        entropy   = "CM";
-    } else {
-        kanzi_level_params(g_kanzi_level, transform, entropy);
-    }
     try {
         std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
         kanzi::CompressedOutputStream cos(ss, jobs, entropy, transform, 4 * 1024 * 1024);
@@ -909,8 +902,8 @@ static bool kanzi_enc(const uint8_t* in, size_t insz, std::vector<uint8_t>& out)
     }
 }
 
-static bool kanzi_dec(const uint8_t* in, size_t insz,
-                      std::vector<uint8_t>& out, size_t expected) {
+static bool kanzi_dec_pipe(const uint8_t* in, size_t insz,
+                           std::vector<uint8_t>& out, size_t expected) {
     try {
         std::stringstream ss(std::string((const char*)in, insz),
                              std::ios::in | std::ios::out | std::ios::binary);
@@ -936,7 +929,25 @@ static bool kanzi_dec(const uint8_t* in, size_t insz,
         return false;
     }
 }
+
+// Single-stream kanzi (used by -kanzi level path).
+static bool kanzi_enc(const uint8_t* in, size_t insz, std::vector<uint8_t>& out) {
+    std::string transform, entropy;
+    kanzi_level_params(g_kanzi_level, transform, entropy);
+    return kanzi_enc_pipe(in, insz, transform, entropy, out);
+}
+
+static bool kanzi_dec(const uint8_t* in, size_t insz,
+                      std::vector<uint8_t>& out, size_t expected) {
+    return kanzi_dec_pipe(in, insz, out, expected);
+}
 #else
+static bool kanzi_enc_pipe(const uint8_t*, size_t, const std::string&, const std::string&, std::vector<uint8_t>&) {
+    snprintf(errormessage, MSG_SIZE, "not compiled with USE_KANZI (-DUSE_KANZI -lkanzi)"); return false;
+}
+static bool kanzi_dec_pipe(const uint8_t*, size_t, std::vector<uint8_t>&, size_t) {
+    snprintf(errormessage, MSG_SIZE, "not compiled with USE_KANZI (-DUSE_KANZI -lkanzi)"); return false;
+}
 static bool kanzi_enc(const uint8_t*, size_t, std::vector<uint8_t>&) {
     snprintf(errormessage, MSG_SIZE, "not compiled with USE_KANZI (-DUSE_KANZI -lkanzi)"); return false;
 }
@@ -1029,33 +1040,53 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
         enc.push_back(fe);
     }
 
-    // Build solid LZMA input:
-    // - For filter-separated frames: [filter_bytes][pixel_bytes]
-    // - For matched non-sep frames: [pixels as-is]
-    // - For stored frames: [idat_raw as-is]
-    std::vector<uint8_t> combined;
-    combined.reserve(total_payload);
-    for (size_t i = 0; i < info.frames.size(); i++) {
-        auto& fr = info.frames[i];
-        auto& fe = enc[i];
-        if (fe.filter_sep) {
-            combined.insert(combined.end(),
-                            sep_filter_bufs[i].begin(), sep_filter_bufs[i].end());
-            combined.insert(combined.end(),
-                            sep_pixel_bufs[i].begin(), sep_pixel_bufs[i].end());
-        } else {
-            // mode 0 and mode 2 use pixels; mode 1 uses raw idat
-            const uint8_t* p = (fe.matched || fe.ldf_mode) ? fr.pixels.data() : fr.idat_raw.data();
-            combined.insert(combined.end(), p, p + fe.payload_sz);
-        }
-    }
-
     bool has_mode2 = false;
     for (auto& fe : enc) if (fe.ldf_mode) { has_mode2 = true; break; }
 
-    std::vector<uint8_t> comp_data;
-    const char* comp_label = use_kanzi ? "Kanzi" : (use_fl2 ? "FL2" : (use_zstd ? "Zstd" : "LZMA"));
-    if (use_kanzi) {
+    // Build solid input. kpng v2 (PPG v12/v13) uses split-stream:
+    //   - pixel section (matched + ldf-mode frames) → kanzi LZP+BWT / CM (best ratio for low-entropy pixels)
+    //   - idat section  (stored frames)             → kanzi LZP+BWT+SRT+ZRLT / FPAQ (fast decode for high-entropy idat)
+    // All other backends (legacy kanzi, fl2, zstd, lzma) keep single-combined layout.
+    bool kpng_v2 = use_kanzi && use_kpng;
+
+    std::vector<uint8_t> combined, px_buf, idat_buf;
+    combined.reserve(total_payload);
+    if (kpng_v2) {
+        px_buf.reserve(total_payload);
+        idat_buf.reserve(total_payload);
+    }
+    for (size_t i = 0; i < info.frames.size(); i++) {
+        auto& fr = info.frames[i];
+        auto& fe = enc[i];
+        bool is_pixel = (fe.matched || fe.ldf_mode);
+        std::vector<uint8_t>* target = kpng_v2 ? (is_pixel ? &px_buf : &idat_buf) : &combined;
+        if (fe.filter_sep) {
+            target->insert(target->end(),
+                           sep_filter_bufs[i].begin(), sep_filter_bufs[i].end());
+            target->insert(target->end(),
+                           sep_pixel_bufs[i].begin(), sep_pixel_bufs[i].end());
+        } else {
+            const uint8_t* p = is_pixel ? fr.pixels.data() : fr.idat_raw.data();
+            target->insert(target->end(), p, p + fe.payload_sz);
+        }
+    }
+
+    // Encode
+    std::vector<uint8_t> comp_data, comp_data_idat;
+    uint64_t px_total = 0, idat_total = 0;
+    const char* comp_label =
+        kpng_v2     ? "kpng2" :
+        use_kanzi   ? "Kanzi" :
+        use_fl2     ? "FL2"   :
+        use_zstd    ? "Zstd"  : "LZMA";
+    if (kpng_v2) {
+        px_total   = (uint64_t)px_buf.size();
+        idat_total = (uint64_t)idat_buf.size();
+        if (!kanzi_enc_pipe(px_buf.data(), px_buf.size(),
+                            "LZP+BWT", "CM", comp_data)) return false;
+        if (!kanzi_enc_pipe(idat_buf.data(), idat_buf.size(),
+                            "LZP+BWT+SRT+ZRLT", "FPAQ", comp_data_idat)) return false;
+    } else if (use_kanzi) {
         if (!kanzi_enc(combined.data(), combined.size(), comp_data)) return false;
     } else if (use_fl2) {
         if (!fl2_enc(combined.data(), combined.size(), comp_data)) return false;
@@ -1068,14 +1099,24 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
     if (verbosity >= 1) {
         std::lock_guard<std::mutex> lk(g_print_mutex);
         clear_bar();
-        fprintf(stdout, "  solid %s: %zu → %zu (%.1f%%)\n",
-                comp_label, total_payload, comp_data.size(),
-                total_payload > 0 ? 100.0 * comp_data.size() / total_payload : 0.0);
+        if (kpng_v2) {
+            fprintf(stdout,
+                "  split %s: px=%zu→%zu  idat=%zu→%zu  total=%zu→%zu\n",
+                comp_label, (size_t)px_total, comp_data.size(),
+                (size_t)idat_total, comp_data_idat.size(),
+                (size_t)(px_total + idat_total),
+                comp_data.size() + comp_data_idat.size());
+        } else {
+            fprintf(stdout, "  solid %s: %zu → %zu (%.1f%%)\n",
+                    comp_label, total_payload, comp_data.size(),
+                    total_payload > 0 ? 100.0 * comp_data.size() / total_payload : 0.0);
+        }
     }
 
-    // v4/v5 = LZMA; v6/v7 = Zstd; v8/v9 = fast-lzma2; v10/v11 = kanzi
+    // v4/v5 = LZMA; v6/v7 = Zstd; v8/v9 = fast-lzma2; v10/v11 = kanzi single; v12/v13 = kpng v2 split-stream
     uint8_t fmt_ver;
-    if (use_kanzi)      fmt_ver = has_mode2 ? 11u : 10u;
+    if (kpng_v2)        fmt_ver = has_mode2 ? 13u : 12u;
+    else if (use_kanzi) fmt_ver = has_mode2 ? 11u : 10u;
     else if (use_fl2)   fmt_ver = has_mode2 ? 9u  : 8u;
     else if (use_zstd)  fmt_ver = has_mode2 ? 7u  : 6u;
     else                fmt_ver = has_mode2 ? 5u  : 4u;
@@ -1125,10 +1166,22 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
         }
     }
 
-    // Solid compressed block (LZMA v4/v5 or Zstd v6/v7)
-    wr_le64(ppg_out, (uint64_t)total_payload);
-    wr_le64(ppg_out, (uint64_t)comp_data.size());
-    wr_bytes(ppg_out, comp_data.data(), comp_data.size());
+    if (kpng_v2) {
+        // v12/v13 split-stream layout:
+        //   [u64 px_raw][u64 px_comp][px_comp bytes : kanzi LZP+BWT / CM]
+        //   [u64 idat_raw][u64 idat_comp][idat_comp bytes : kanzi LZP+BWT+SRT+ZRLT / FPAQ]
+        wr_le64(ppg_out, px_total);
+        wr_le64(ppg_out, (uint64_t)comp_data.size());
+        wr_bytes(ppg_out, comp_data.data(), comp_data.size());
+        wr_le64(ppg_out, idat_total);
+        wr_le64(ppg_out, (uint64_t)comp_data_idat.size());
+        wr_bytes(ppg_out, comp_data_idat.data(), comp_data_idat.size());
+    } else {
+        // Solid compressed block (LZMA v4/v5, Zstd v6/v7, FL2 v8/v9, kanzi v10/v11)
+        wr_le64(ppg_out, (uint64_t)total_payload);
+        wr_le64(ppg_out, (uint64_t)comp_data.size());
+        wr_bytes(ppg_out, comp_data.data(), comp_data.size());
+    }
 
     return true;
 }
@@ -1389,29 +1442,62 @@ static bool decompress_solid(const uint8_t* p, size_t sz, size_t pos,
         if (!read_frame_solid_meta(p, sz, pos, frames[i], payload_szs[i], ppg_version))
             return false;
 
-    if (pos + 16 > sz) { snprintf(errormessage, MSG_SIZE, "PPG solid truncated (comp hdr)"); return false; }
-    uint64_t total_raw = rd_le64(p + pos); pos += 8;
-    uint64_t comp_sz   = rd_le64(p + pos); pos += 8;
-    if (pos + comp_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG solid truncated (comp data)"); return false; }
-    std::vector<uint8_t> combined;
-    if (ppg_version >= 10) {
-        if (!kanzi_dec(p + pos, comp_sz, combined, total_raw)) return false;
-    } else if (ppg_version >= 8) {
-        if (!fl2_dec(p + pos, comp_sz, combined, total_raw)) return false;
-    } else if (ppg_version >= 6) {
-        if (!zstd_dec(p + pos, comp_sz, combined, total_raw)) return false;
+    std::vector<uint8_t> px_part, idat_part;
+    bool kpng_v2 = (ppg_version >= 12);
+
+    if (kpng_v2) {
+        // v12/v13: split-stream — [u64 px_raw][u64 px_comp][px_comp][u64 idat_raw][u64 idat_comp][idat_comp]
+        if (pos + 16 > sz) { snprintf(errormessage, MSG_SIZE, "PPG split truncated (px hdr)"); return false; }
+        uint64_t px_raw  = rd_le64(p + pos); pos += 8;
+        uint64_t px_comp = rd_le64(p + pos); pos += 8;
+        if (pos + px_comp > sz) { snprintf(errormessage, MSG_SIZE, "PPG split truncated (px data)"); return false; }
+        if (px_raw > 0 && !kanzi_dec_pipe(p + pos, px_comp, px_part, px_raw)) return false;
+        if (px_raw == 0) px_part.clear();
+        pos += px_comp;
+        if (pos + 16 > sz) { snprintf(errormessage, MSG_SIZE, "PPG split truncated (idat hdr)"); return false; }
+        uint64_t idat_raw  = rd_le64(p + pos); pos += 8;
+        uint64_t idat_comp = rd_le64(p + pos); pos += 8;
+        if (pos + idat_comp > sz) { snprintf(errormessage, MSG_SIZE, "PPG split truncated (idat data)"); return false; }
+        if (idat_raw > 0 && !kanzi_dec_pipe(p + pos, idat_comp, idat_part, idat_raw)) return false;
+        if (idat_raw == 0) idat_part.clear();
+        pos += idat_comp;
     } else {
-        if (!lzma_dec(p + pos, comp_sz, combined, total_raw)) return false;
+        if (pos + 16 > sz) { snprintf(errormessage, MSG_SIZE, "PPG solid truncated (comp hdr)"); return false; }
+        uint64_t total_raw = rd_le64(p + pos); pos += 8;
+        uint64_t comp_sz   = rd_le64(p + pos); pos += 8;
+        if (pos + comp_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG solid truncated (comp data)"); return false; }
+        std::vector<uint8_t> combined;
+        if      (ppg_version >= 10) { if (!kanzi_dec(p + pos, comp_sz, combined, total_raw)) return false; }
+        else if (ppg_version >=  8) { if (!fl2_dec  (p + pos, comp_sz, combined, total_raw)) return false; }
+        else if (ppg_version >=  6) { if (!zstd_dec (p + pos, comp_sz, combined, total_raw)) return false; }
+        else                        { if (!lzma_dec (p + pos, comp_sz, combined, total_raw)) return false; }
+        // Split combined back into per-frame payloads using mode (matched/ldf → pixel buf, stored → idat buf).
+        // For non-split formats the data is sequential; we just hand each frame its portion in order.
+        px_part = std::move(combined);
+        // px_part holds everything in order; idat_part stays empty; the loop below will pull sequentially.
     }
 
-    size_t offset = 0;
+    size_t px_off = 0, idat_off = 0;
     for (uint32_t i = 0; i < num_frames; i++) {
         size_t psz = (size_t)payload_szs[i];
-        if (offset + psz > combined.size()) {
-            snprintf(errormessage, MSG_SIZE, "PPG solid payload split error frame %u", i); return false;
+        if (kpng_v2) {
+            // mode 0 (matched) and mode 2 (ldf) → pixel buffer; mode 1 (stored) → idat buffer
+            bool from_pixel = (frames[i].mode != 1);
+            std::vector<uint8_t>& src = from_pixel ? px_part : idat_part;
+            size_t& off = from_pixel ? px_off : idat_off;
+            if (off + psz > src.size()) {
+                snprintf(errormessage, MSG_SIZE, "PPG v12 payload split error frame %u (%s)",
+                         i, from_pixel ? "px" : "idat"); return false;
+            }
+            frames[i].payload.assign(src.begin() + off, src.begin() + off + psz);
+            off += psz;
+        } else {
+            if (px_off + psz > px_part.size()) {
+                snprintf(errormessage, MSG_SIZE, "PPG solid payload split error frame %u", i); return false;
+            }
+            frames[i].payload.assign(px_part.begin() + px_off, px_part.begin() + px_off + psz);
+            px_off += psz;
         }
-        frames[i].payload.assign(combined.begin() + offset, combined.begin() + offset + psz);
-        offset += psz;
     }
 
     png_out.clear();
@@ -1533,7 +1619,7 @@ static bool decompress_ppg(const std::vector<uint8_t>& ppg_buf,
         return true;
     }
 
-    if (version >= 3 && version <= 11)
+    if (version >= 3 && version <= 13)
         return decompress_solid(p, sz, pos, version, png_out);
 
     snprintf(errormessage, MSG_SIZE, "unknown PPG version %u", version); return false;
@@ -1898,18 +1984,19 @@ static void list_ppg(const std::string& path) {
         return;
     }
 
-    if (version >= 3 && version <= 11) {
+    if (version >= 3 && version <= 13) {
         bool is_apng   = (buf[pos++] & 1) != 0;
         uint32_t plays = rd_le32(buf.data()+pos); pos+=4;
         uint64_t pre_sz=rd_le64(buf.data()+pos); pos+=8; pos+=pre_sz;
         uint64_t post_sz=rd_le64(buf.data()+pos); pos+=8; pos+=post_sz;
         uint32_t nf   = rd_le32(buf.data()+pos); pos+=4;
-        const char* compressor = (version >= 10) ? "Kanzi" :
+        const char* compressor = (version >= 12) ? "kpng2" :
+                                 (version >= 10) ? "Kanzi" :
                                  (version >= 8)  ? "FL2"   :
                                  (version >= 6)  ? "Zstd"  : "LZMA";
         const char* fmtdesc = (version == 3) ? "" :
-                              (version == 4 || version == 6 || version == 8 || version == 10) ? " + filter sep" :
-                                                                                                  " + filter sep + ldf-repack";
+                              (version == 4 || version == 6 || version == 8 || version == 10 || version == 12) ?
+                                  " + filter sep" : " + filter sep + ldf-repack";
         fprintf(stdout, "  PPG v%u  %s  %u frame(s)%s  [solid %s%s]\n",
                 version, is_apng?"APNG":"PNG", nf,
                 is_apng ? (" loops=" + std::to_string(plays)).c_str() : "",
@@ -1946,13 +2033,32 @@ static void list_ppg(const std::string& path) {
                     uses_idat?"IDAT":"fdAT", lv, strategy_name(st), wb, ml,
                     (unsigned long long)psz, extra.c_str());
         }
-        if (pos+16 <= buf.size()) {
+        if (version >= 12) {
+            // split-stream: [u64 px_raw][u64 px_comp][px_comp][u64 idat_raw][u64 idat_comp][idat_comp]
+            if (pos+16 <= buf.size()) {
+                uint64_t px_raw  = rd_le64(buf.data()+pos); pos+=8;
+                uint64_t px_comp = rd_le64(buf.data()+pos); pos+=8;
+                pos += px_comp;
+                uint64_t idat_raw = 0, idat_comp = 0;
+                if (pos+16 <= buf.size()) {
+                    idat_raw  = rd_le64(buf.data()+pos); pos+=8;
+                    idat_comp = rd_le64(buf.data()+pos);
+                }
+                fprintf(stdout, "  kpng2 split: px=%llu→%llu  idat=%llu→%llu  total=%llu→%llu\n",
+                        (unsigned long long)px_raw, (unsigned long long)px_comp,
+                        (unsigned long long)idat_raw, (unsigned long long)idat_comp,
+                        (unsigned long long)(px_raw + idat_raw),
+                        (unsigned long long)(px_comp + idat_comp));
+            }
+        } else if (pos+16 <= buf.size()) {
             uint64_t total_raw=rd_le64(buf.data()+pos); pos+=8;
             uint64_t comp_sz  =rd_le64(buf.data()+pos);
+            const char* solid_label =
+                (version >= 10) ? "Kanzi" :
+                (version >= 8)  ? "FL2"   :
+                (version >= 6)  ? "Zstd"  : "LZMA";
             fprintf(stdout, "  Solid %s: %llu → %llu (%.1f%%)\n",
-                    (version >= 10) ? "Kanzi" :
-                    (version >= 8)  ? "FL2"   :
-                    (version >= 6)  ? "Zstd"  : "LZMA",
+                    solid_label,
                     (unsigned long long)total_raw, (unsigned long long)comp_sz,
                     total_raw > 0 ? 100.0*comp_sz/total_raw : 0.0);
         }
@@ -1990,7 +2096,9 @@ static void show_help() {
         "  -fl2         fast-lzma2 backend (PPG v8/v9, ~2-4x faster, +1-2%% size)\n"
         "  -kanzi       kanzi BWT+CM backend (PPG v10/v11, default level 7; slow decomp)\n"
         "  -kanzi<1-9>  kanzi with explicit level (5=balanced, 7=generic sweet spot, 9=TPAQX max ratio)\n"
-        "  -kpng        PNG-tuned kanzi pipeline (LZP+BWT / CM) — best ratio for PNG data; same v10/v11 format\n"
+        "  -kpng        kpng v2 — split-stream PNG-aware encoder (PPG v12/v13)\n"
+        "                 pixels → kanzi LZP+BWT / CM (best ratio)\n"
+        "                 stored idat → kanzi LZP+BWT+SRT+ZRLT / FPAQ (fast decode)\n"
         "  -th<N>       N file-level threads (0=auto)\n"
         "  -sfth        parallel brute-force + MT-LZMA within each file (4 threads, single-file mode; -th<N/4> for batch)\n"
         "  -od<path>    write output to directory\n"
