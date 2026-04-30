@@ -1,13 +1,18 @@
 # packPNG
 
-**Lossless PNG/APNG recompressor.** When you pack any number of PNGs, the new **tovyCIP** archive format (`.tcip`) beats `xz -m6` on size, encode time and decode time on real corpora — while staying byte-exact reversible to the original PNG files.
+**Lossless PNG/APNG recompressor.** When you pack any number of PNGs, the **tovyCIP** archive format beats `xz -m6` on size, encode time and decode time on real corpora — while staying byte-exact reversible to the original PNG files.
 
 ```bash
-packPNG a image.png        # → image.tcip   (1-entry archive)
-packPNG a *.png            # → archive.tcip (multi-PNG archive)
-packPNG x archive.tcip     # extract back to byte-exact .png files
-packPNG a -perfile *.png   # legacy: produce one .ppg per .png
+packPNG a image.png        # → image.ppg     (1-entry tovyCIP archive)
+packPNG a *.png            # → archive.ppg   (multi-PNG tovyCIP archive)
+packPNG x archive.ppg      # extract back to byte-exact .png files
+packPNG a -perfile *.png   # opt-out: one per-file .ppg per .png (no archive)
 ```
+
+> **v1.6:** unified `.ppg` extension for all packPNG output. tovyCIP archives
+> previously written as `.tcip` are now `.ppg` too — the decoder dispatches by
+> magic byte (`PPG1` = single-file packPNG, `TCIP`/`PPGS` = tovyCIP archive).
+> Legacy `.tcip` and `.ppgs` files keep decoding without changes.
 
 ## Benchmarks vs xz preset 6
 
@@ -20,7 +25,7 @@ packPNG a -perfile *.png   # legacy: produce one .ppg per .png
 | **decode (single thread)** | 0.096 s | **0.072 s** | **−25 %** ✓ |
 | **decode (multi-thread)** median | 0.050 s | **~0.054 s** | within noise (±5 ms variance) |
 
-Single-file too: for `Cspeed.png` (~70 KB raw), the 1-entry `.tcip` is **23,185 B vs 25,477 B** for legacy `.ppg` (`−2,292 B`, −9 %). The kanzi BWT pipeline beats LZMA-6 even on a single file — no archive-framing penalty in practice.
+Single-file too: for `Cspeed.png` (~70 KB raw), the 1-entry tovyCIP `.ppg` is **23,185 B vs 25,477 B** for the per-file `.ppg` (`-perfile` mode) (`−2,292 B`, −9 %). The kanzi BWT pipeline beats LZMA-6 even on a single file — no archive-framing penalty in practice.
 
 `-kpng-max` (TPAQ) trades decode speed for max ratio: **−8,914 B** vs xz, but ~2.8× slower decode. Use only when archive size matters more than read latency.
 
@@ -102,26 +107,32 @@ General:
   -dry         dry run (no output files written)
   -th<N>       worker threads (0 = auto, recommended for tovyCIP)
   -sfth        parallel brute-force within each file
-  -od<path>    write output to directory or .tcip file
+  -od<path>    write output to directory or .ppg file (.tcip / .ppgs also accepted)
   -module      machine-friendly output
   --no-color   disable ANSI color
 ```
 
 ## File formats
 
-| Format | Magic | Role |
-|---|---|---|
-| **`.tcip`** | `TCIP` | **tovyCIP archive — default output for any PNG count** |
-| `.ppg` | `PPG1` | Legacy per-file (opt-in via `-perfile`) |
-| `.ppgs` | `PPGS` | Legacy archive — still decodable, no longer produced |
+Since v1.6 every output uses the `.ppg` extension; the decoder selects the
+right path by reading the file's magic bytes, not its name.
 
-The decoder accepts every historical `.ppg` version (v1..v15) and every `.ppgs` archive produced by earlier releases. Round-trip is byte-exact for all of them.
+| Output | Magic | When you get it |
+|---|---|---|
+| **`.ppg`** | `TCIP` | **tovyCIP archive — default for any PNG count (v1.6+)** |
+| `.ppg`     | `PPG1` | Per-file packPNG (opt-in via `-perfile`) |
+| `.tcip`    | `TCIP` | Legacy tovyCIP archive name (v1.5) — still decodable |
+| `.ppgs`    | `PPGS` | Legacy archive (v1.4–v1.5pre) — still decodable |
+
+The decoder accepts every historical `.ppg` version (v1..v15), every `.ppgs`
+archive, and every `.tcip` archive produced by earlier releases. Round-trip is
+byte-exact for all of them.
 
 ## Robustness
 
 - 162/162 PngSuite valid PNGs round-trip byte-exact (per-file + tovyCIP archive).
 - 14/14 PngSuite intentionally-corrupt PNGs handled gracefully — no crashes, no hangs.
-- 1,500+ fuzz trials of bit-flipped / truncated / appended / fully-random `.tcip` inputs — zero AddressSanitizer errors.
+- 1,500+ fuzz trials of bit-flipped / truncated / appended / fully-random tovyCIP archive inputs — zero AddressSanitizer errors.
 - Encode is deterministic (5× same input → identical SHA-256), and 3 concurrent encoders produce identical output (race-free).
 
 ## Targets
