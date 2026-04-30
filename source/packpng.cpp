@@ -27,6 +27,7 @@
 #include <cstring>
 #include <filesystem>
 #include <istream>
+#include <map>
 #include <mutex>
 #include <streambuf>
 #include <string>
@@ -68,7 +69,7 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "";   // letra = bugfix-only; sin letra = feature
+static const char* subversion = "a";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
 static const int   ver_major  = 1;    // v1.7 — packPNG returns to per-file recompressor (1 PNG → 1 .ppg). tovyCIP is the algorithm (kanzi RLT+BWT+SRT+ZRLT/FPAQ + zstd-19-long), used as the default backend per file. Multi-PNG inputs produce multi-PNG outputs (no archive grouping). Output collisions resolved by appending (N): image.ppg, image(1).ppg, image(2).ppg. Legacy multi-entry .tcip/.ppgs/.ppg archives still decode for back-compat.
 static const int   ver_minor  = 7;
@@ -3437,6 +3438,8 @@ int main(int argc, char** argv)
         // Collect PNG paths (skip + warn on non-PNG)
         std::vector<std::string> paths;
         std::vector<std::string> src_roots;
+        std::vector<std::string> skip_not_png;
+        std::vector<std::string> skip_not_found;
         for (auto& f : filelist) {
             FileType ft = detect_type(f.path);
             if (ft == F_PNG) {
@@ -3444,13 +3447,40 @@ int main(int argc, char** argv)
                 src_roots.push_back(f.src_root);
             } else {
                 std::error_code ec;
-                if (!std::filesystem::exists(f.path, ec)) {
-                    fprintf(stderr, "%sskip%s %s: file not found\n",
-                            col(YL), col(R), f.path.c_str());
-                } else {
-                    fprintf(stderr, "%sskip%s %s: not a PNG (magic mismatch)\n",
-                            col(YL), col(R), f.path.c_str());
-                }
+                if (!std::filesystem::exists(f.path, ec))
+                    skip_not_found.push_back(f.path);
+                else
+                    skip_not_png.push_back(f.path);
+            }
+        }
+        // Compact skip summary by default; full list under -v1+.
+        if (!skip_not_found.empty()) {
+            fprintf(stderr, "%sskipped%s %zu missing file(s)\n",
+                    col(YL), col(R), skip_not_found.size());
+            if (verbosity >= 1) {
+                for (auto& p : skip_not_found)
+                    fprintf(stderr, "    %s\n", p.c_str());
+            }
+        }
+        if (!skip_not_png.empty()) {
+            // Group by lowercase extension so the user sees what got rejected.
+            std::map<std::string, int> ext_counts;
+            for (auto& p : skip_not_png) {
+                auto ext = std::filesystem::path(p).extension().string();
+                for (auto& c : ext) c = (char)tolower((unsigned char)c);
+                if (ext.empty()) ext = "(no ext)";
+                ext_counts[ext]++;
+            }
+            std::string breakdown;
+            for (auto& kv : ext_counts) {
+                if (!breakdown.empty()) breakdown += ", ";
+                breakdown += std::to_string(kv.second) + " " + kv.first;
+            }
+            fprintf(stderr, "%sskipped%s %zu non-PNG file(s) — %s\n",
+                    col(YL), col(R), skip_not_png.size(), breakdown.c_str());
+            if (verbosity >= 1) {
+                for (auto& p : skip_not_png)
+                    fprintf(stderr, "    %s\n", p.c_str());
             }
         }
         if (paths.empty()) {
@@ -3521,7 +3551,9 @@ int main(int argc, char** argv)
             uint64_t out_b = total_out.load();
             int ok_count = (int)paths.size() - errors.load();
             double ratio = in_b > 0 ? (100.0 * out_b / in_b) : 0.0;
-            fprintf(stdout, "%d file(s)  %.2f%%\n", ok_count, ratio);
+            auto t1 = std::chrono::steady_clock::now();
+            double dt = std::chrono::duration<double>(t1 - t0).count();
+            fprintf(stdout, "%d file(s)  %.2f%%  %.2fs\n", ok_count, ratio, dt);
         }
         return errors.load() > 0 ? 1 : 0;
     }
