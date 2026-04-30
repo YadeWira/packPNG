@@ -67,7 +67,7 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "a";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "b";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
 static const int   ver_major  = 1;    // v1.6 — unified .ppg extension. tovyCIP remains the default algorithm; archives now write .ppg instead of .tcip. Per-file packPNG mode (-perfile) also writes .ppg. Decoder dispatches by magic byte (PPG1=single, TCIP/PPGS=archive). Legacy .tcip / .ppgs files still decode.
 static const int   ver_minor  = 6;
@@ -2324,6 +2324,10 @@ static bool compress_tovycip_archive(
         if (nm.empty()) nm = fs::path(png_paths[i]).filename().string();
         works[i].name = nm;
     }
+    // Reset progress counter so the bar tracks the parallel extract phase
+    // (which dominates wallclock for big corpora). Total = number of inputs.
+    g_files_done = 0;
+    g_total_files = (int)works.size();
     int n_extract = (int)std::thread::hardware_concurrency();
     if (n_extract < 1) n_extract = 1;
     if ((size_t)n_extract > works.size()) n_extract = (int)works.size();
@@ -2336,9 +2340,10 @@ static bool compress_tovycip_archive(
                 if (i >= works.size()) break;
                 auto& w = works[i];
                 auto png_buf = read_file(w.path);
-                if (png_buf.empty()) continue;
+                if (png_buf.empty()) { tick_bar(); continue; }
                 w.e.name = w.name;
                 w.ok = extract_solid_streams(png_buf, w.px, w.idat, w.e);
+                tick_bar();
                 if (!w.ok) w.err = errormessage;
             }
         });
@@ -2565,6 +2570,7 @@ static bool compress_tovycip_archive(
                 big_idat.size(), idat_comp.size(),
                 out.size());
     }
+    finish_bar();
     return write_file(out_path, out);
 }
 
