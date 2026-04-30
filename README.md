@@ -1,81 +1,51 @@
 # packPNG
 
-**v1.5 — tovyCIP archive (DEFAULT).** Lossless PNG/APNG recompressor built around the **tovyCIP** archive format ("Tovy Compresor de Imágenes PNG"), a multi-stream solid archive that achieves a **strict 4-axis WIN over xz preset 6** on a 23-PNG test corpus (size, comp, decST, dec-th0).
+**Lossless PNG/APNG recompressor.** When you pack any number of PNGs, the new **tovyCIP** archive format (`.tcip`) beats `xz -m6` on size, encode time and decode time on real corpora — while staying byte-exact reversible to the original PNG files.
 
-> When you pack one or more PNGs, packPNG produces a single `.tcip` archive that beats xz on all 4 axes. Single-file output is named after the source (`image.png → image.tcip`); multi-file output is `archive.tcip`. Pass `-perfile` to fall back to the traditional per-file `.ppg` format.
+```bash
+packPNG a image.png        # → image.tcip   (1-entry archive)
+packPNG a *.png            # → archive.tcip (multi-PNG archive)
+packPNG x archive.tcip     # extract back to byte-exact .png files
+packPNG a -perfile *.png   # legacy: produce one .ppg per .png
+```
 
-## What's new in v1.5
+## Benchmarks vs xz preset 6
 
-| Feature | Status |
-|---|---|
-| **tovyCIP archive** (`.tcip`, magic `TCIP`) | NEW — default for any PNG count |
-| 2-stream parallel kanzi pixel decode | NEW |
-| Auto `-th0` = `hw_concurrency - num_streams` | NEW (no thread oversubscription) |
-| Encode reorder: biggest entry → stream 0 | NEW |
-| `move`-not-`copy` in `emit_idat_or_fdat` | NEW (-9 ms dec-th0) |
-| `PACKPNG_NO_FSEP_ABOVE` env var | NEW (opt-in, -3 ms dec-th0) |
-| Legacy `.ppgs` magic | still readable at decode |
-| `.ppg` per-file format (v1..v15) | unchanged, opt-in via `-perfile` |
-| `-solid` flag | preserved as legacy alias of `-tovycip` |
+23-PNG corpus, ~10.5 MB raw, AMD A8-6600K, 40-trial interleaved.
 
-## Strict 4-axis WIN vs xz preset 6
+| metric | xz `-m6` | packPNG (tovyCIP) | Δ |
+|---|---:|---:|---:|
+| **size** | 1,722,720 B | **1,720,912 B** | **−1,808 B** ✓ |
+| **encode time** | 1.43 s | **0.70 s** | **−51 %** ✓ |
+| **decode (single thread)** | 0.096 s | **0.072 s** | **−25 %** ✓ |
+| **decode (multi-thread)** median | 0.050 s | **~0.054 s** | within noise (±5 ms variance) |
 
-40-trial interleaved bench, AMD A8-6600K, corpus of 23 PNGs (10.5 MB raw):
+Single-file too: for `Cspeed.png` (~70 KB raw), the 1-entry `.tcip` is **23,185 B vs 25,477 B** for legacy `.ppg` (`−2,292 B`, −9 %). The kanzi BWT pipeline beats LZMA-6 even on a single file — no archive-framing penalty in practice.
 
-| metric | xz `-m6` | packPNG v1.5 (`tovyCIP`) | Δ | winner |
-|---|---:|---:|---:|:---:|
-| size | 1,722,720 B | **1,722,197 B** | **-523 B** | ✅ tovyCIP |
-| comp | 1.43 s | **0.88 s** | **-38 %** | ✅ tovyCIP |
-| decST (single-thread) | 0.096 s | **0.072 s** | **-25 %** | ✅ tovyCIP |
-| dec-th0 (multi-thread) median | 0.050 s | **0.048 s** | **-2 ms** | ✅ tovyCIP |
+`-kpng-max` (TPAQ) trades decode speed for max ratio: **−8,914 B** vs xz, but ~2.8× slower decode. Use only when archive size matters more than read latency.
 
-Pairwise dec-th0 (40 trials): **tovyCIP 26 / xz 7 / tie 7**. tovyCIP also has lower max (0.054 s vs xz 0.061 s) — more consistent.
+## How tovyCIP works
 
-## How it works
-
-### Per-file `.ppg` mode (single PNG, or `-perfile`)
-
-1. **Parse** PNG/APNG into frames and inflate each IDAT stream to raw pixels.
-2. **Brute-force** all zlib parameter combinations (level / strategy / wbits / memlevel) to find the one that reproduces the original deflate stream byte-exactly. Bailouts: O(1) zlib-header pre-filter, early-out after K=8 consecutive probe failures, cap of 20 full-deflate calls per IDAT.
-3. **Filter-byte separation**: split PNG filter bytes from pixel data (improves the LZ77 matching of the chosen backend).
-4. **Compress** all frames in one solid block — LZMA by default; or `-zstd`, `-fl2`, `-kanzi` for alternative backends.
-5. Output: `.ppg` file, fully reversible back to the original PNG/APNG (byte-exact).
-
-### tovyCIP archive mode (DEFAULT, multi-PNG)
-
-1. Run the per-file extract+match phase on each PNG to get its **pixel buffer** (mode 0/2) or **idat passthrough** (mode 1) plus per-PNG metadata (chunks, fctl, mode/level/strategy/wbits/memlevel).
-2. **Sort entries by `px_sz` descending** (biggest entry first).
-3. **Split into N streams** (N=2 by default): stream 0 holds the biggest entry alone (typically the bottleneck file), stream 1 holds the rest.
-4. Encode each pixel stream **in parallel** with kanzi `RLT+BWT+SRT+ZRLT/FPAQ`:
-   - stream 0: `block_size = 2 MB`, `jobs = 4` (kanzi internally parallelizes the multiple blocks of the dominant entry).
-   - stream 1: `block_size = 4 MB`, `jobs = 4` (better cross-block ratio for many small entries).
-5. Encode all idat-passthrough sections together with **zstd-19 long** (`windowLog = 27`, 128 MB window).
-6. Build per-entry meta table with stream index + offset, zstd-compress it, and emit the `.tcip` archive.
-7. **Decode** spawns one thread per pixel stream + one for zstd_idat (all parallel). With `-th0`, automatically picks `n_workers = hw_concurrency - num_streams` reconstruct workers — keeps total active threads ≤ core count, avoiding contention.
+1. **Parse** each PNG/APNG into frames; **inflate** each IDAT stream to raw pixels.
+2. **Brute-force** zlib parameters (level, strategy, wbits, memlevel) to find the combination that reproduces the original deflate stream byte-exactly. If found → mode 0 (store raw pixels). Else → mode 1 (store the deflate stream as-is) or, with `-ldf`, mode 2 (libdeflate pixel-exact repack).
+3. **Filter-byte separation**: split the per-scanline filter byte from the pixel payload (clusters similar bytes for better BWT).
+4. **Sort entries** by pixel-buffer size descending — biggest entry first.
+5. **Split into 2 kanzi streams**: stream 0 = biggest entry alone (block 2 MB); stream 1 = rest (block 4 MB). Both encode in parallel threads. Pipeline: `RLT + BWT + SRT + ZRLT / FPAQ`.
+6. **IDAT-passthrough section**: zstd-19 with `windowLog=27` (long-range, 128 MB window).
+7. **Decode** spawns one thread per pixel stream + one for zstd_idat (all parallel). With `-th0`, automatically picks `n_workers = hw_concurrency − num_streams` to avoid thread oversubscription.
 
 ### Algorithms inside tovyCIP
 
-- **RLT** — Run-Length Transform (compresses runs of repeated bytes).
-- **BWT** — Burrows-Wheeler Transform (block-sort; clusters similar symbols).
-- **SRT** — Sorted Rank Transform (post-BWT; better than MTF on this stage).
-- **ZRLT** — Zero Run-Length Transform (compresses the long runs of zeros that SRT produces).
-- **FPAQ** — Fast PAQ (order-0 binary arithmetic coder; bit-adaptive).
-- **zstd-19 long** — for the IDAT-passthrough section, where high entropy of original deflate streams plays to zstd's long-range matcher.
-
-## Benchmarks
-
-Real-world corpus (23 PNGs, ~10.5 MB raw):
-
-| Mode | Output size | Ratio | Notes |
-|---|---:|---:|---|
-| **`tovyCIP` (default)** | **1,720,912 B** | 16.4 % | strict 4-axis WIN over xz preset 6 |
-| `xz -m6` (per-file LZMA) | 1,722,720 B | 16.4 % | baseline |
-| `-kpng-max` (TPAQ ratio mode) | 1,713,806 B | 16.3 % | -8.9 KB but 2.8× slower decode |
-| `-perfile` (legacy LZMA-6) | 1,722,720 B | 16.4 % | per-file `.ppg` output |
+| | |
+|---|---|
+| **RLT** | Run-Length Transform — collapses runs of repeated bytes |
+| **BWT** | Burrows-Wheeler Transform — block-sort that clusters similar symbols |
+| **SRT** | Sorted Rank Transform — post-BWT recoding (better than MTF on this stage) |
+| **ZRLT** | Zero Run-Length Transform — collapses the long zero runs SRT produces |
+| **FPAQ** | Fast PAQ — order-0 binary arithmetic coder, bit-adaptive |
+| **zstd-19 long** | for IDAT-passthrough; high-entropy already-compressed deflate streams |
 
 ## Build
-
-**Dependencies:** zlib, liblzma; **strongly recommended** (for tovyCIP): libzstd, libdeflate, kanzi-cpp.
 
 ```bash
 # Full feature build (recommended — needed for tovyCIP)
@@ -84,18 +54,15 @@ g++ -std=c++17 -O3 -funroll-loops -fomit-frame-pointer -march=native \
     -I<path-to-kanzi-cpp>/src \
     -o packPNG source/packpng.cpp \
     -lz -llzma -lzstd -ldeflate \
-    <path-to-kanzi-cpp>/build/libkanzi.a \
-    -lpthread
+    <path-to-kanzi-cpp>/build/libkanzi.a -lpthread
 
-# Minimal build (per-file LZMA only — no tovyCIP)
+# Minimal build — per-file LZMA only, no tovyCIP
 make
 ```
 
-**Linux (Debian/Ubuntu):**
-```bash
-sudo apt install zlib1g-dev liblzma-dev libdeflate-dev libzstd-dev
-# Plus build kanzi-cpp from https://github.com/flanglet/kanzi-cpp
-```
+Debian/Ubuntu deps: `apt install zlib1g-dev liblzma-dev libdeflate-dev libzstd-dev`. Plus build [kanzi-cpp](https://github.com/flanglet/kanzi-cpp) into a static lib.
+
+Windows cross-compile: `make win` (currently LZMA-only — for tovyCIP on Windows, build mingw kanzi-cpp + libzstd + libdeflate locally).
 
 ## Usage
 
@@ -108,23 +75,23 @@ Subcommands:
   mix          both directions (default)
   l / list     inspect .ppg files
 
-tovyCIP archive flags (NEW in v1.5):
+tovyCIP archive flags:
   -tovycip     force tovyCIP archive mode (default for any PNG count)
   -tcip        alias of -tovycip
   -solid       legacy alias of -tovycip
-  -perfile     opt out: produce traditional per-file .ppg output
-  -kpng-max    tovyCIP + max-ratio TPAQ pipeline (8.9 KB smaller, 2.8× slower decode)
+  -perfile     opt out → traditional per-file .ppg output
+  -kpng-max    tovyCIP + TPAQ entropy: max ratio, slow decode
 
-Per-file flags (apply to .ppg mode):
+Per-file (.ppg) flags:
   -m<1-9>      LZMA preset (default 6)
   -me          LZMA extreme flag
   -deep        disable brute-force early-out (~2× slower, ~6 % smaller)
-  -ldf         libdeflate pixel-exact fallback for unmatched frames (PPG v5)
-  -zstd        per-file Zstd instead of LZMA (PPG v6/v7)
-  -fl2         per-file fast-lzma2 (PPG v8/v9)
-  -kanzi       per-file kanzi (PPG v10/v11)
-  -kpng        per-file kanzi PNG-tuned split-stream (PPG v14/v15)
-  -zl=<1-22>   Zstd level (default 19, requires -zstd)
+  -ldf         libdeflate pixel-exact fallback for unmatched frames
+  -zstd        per-file Zstd instead of LZMA
+  -fl2         per-file fast-lzma2
+  -kanzi       per-file kanzi
+  -kpng        per-file kanzi PNG-tuned split-stream
+  -zl=<1-22>   Zstd level (default 19)
 
 General:
   -ver         verify round-trip after processing
@@ -133,71 +100,36 @@ General:
   -o           overwrite existing output files
   -r           recurse into subdirectories
   -dry         dry run (no output files written)
-  -th<N>       file-level threads (0 = auto, recommended for tovyCIP)
+  -th<N>       worker threads (0 = auto, recommended for tovyCIP)
   -sfth        parallel brute-force within each file
   -od<path>    write output to directory or .tcip file
   -module      machine-friendly output
   --no-color   disable ANSI color
 ```
 
-**Examples:**
-```bash
-packPNG a image.png                     # single file → image.tcip (1-entry archive)
-packPNG a *.png                         # multi  → archive.tcip
-packPNG a -tcip *.png                   # explicit tovyCIP
-packPNG a -perfile image.png            # legacy → image.ppg
-packPNG a -perfile *.png                # legacy → N .ppg files
-packPNG a -kpng-max *.png               # max ratio (TPAQ), slower decode
-packPNG a -ver -o image.png             # compress, verify, overwrite
-packPNG a -th0 -od out/ *.png           # auto-thread batch to directory
-packPNG x image.tcip                    # decompress tovyCIP archive
-packPNG x archive.ppgs                  # legacy archive (still works)
-packPNG l image.ppg                     # inspect a per-file .ppg
-```
-
-> **Surprise win for single-file:** for the test PNG `Cspeed.png` (~70 KB raw),
-> the 1-entry `.tcip` is **2,292 bytes smaller** than the legacy `.ppg` (23,185 vs 25,477) —
-> kanzi's BWT-based pipeline beats LZMA-6 even for a single file. No archive-framing
-> penalty in practice; the new default is strictly better on size, comp, and decode speed.
-
 ## File formats
 
-| Format | Magic | Use |
+| Format | Magic | Role |
 |---|---|---|
-| **`.tcip`** | `TCIP` | tovyCIP archive (default for any PNG count) |
-| `.ppgs` | `PPGS` | legacy archive (still decoded by v1.5) |
-| `.ppg` | `PPG1` | legacy per-file (opt-in via `-perfile`); versions v1..v15 below |
+| **`.tcip`** | `TCIP` | **tovyCIP archive — default output for any PNG count** |
+| `.ppg` | `PPG1` | Legacy per-file (opt-in via `-perfile`) |
+| `.ppgs` | `PPGS` | Legacy archive — still decodable, no longer produced |
 
-### Per-file `.ppg` versions (all decodable by v1.5)
+The decoder accepts every historical `.ppg` version (v1..v15) and every `.ppgs` archive produced by earlier releases. Round-trip is byte-exact for all of them.
 
-| Version | Compressor | Features |
-|---|---|---|
-| v1 / v2 | LZMA | single / multi-frame, per-frame block |
-| v3 / v4 / v5 | LZMA | solid + filter sep + libdeflate fallback |
-| v6 / v7 | Zstd | alternative to v4 / v5 |
-| v8 / v9 | fast-lzma2 | alternative to v4 / v5 |
-| v10 / v11 | kanzi (single-stream) | BWT+CM backend |
-| v12 / v13 | kanzi (legacy split) | v1.4 only |
-| v14 / v15 | kanzi (current split) | RLT+BWT+SRT+ZRLT/FPAQ pixels + zstd-19-long idat |
+## Robustness
 
-### tovyCIP `.tcip` versions
-
-| Version | Notes |
-|---|---|
-| **v1** | 2-stream parallel kanzi pixels + zstd-19-long idat + per-entry stream_idx tag |
-| (legacy v1) | same wire layout as PPGS v1 — single-stream — still readable |
-| (legacy v2) | same wire layout as PPGS v2 — multi-stream — same as TCIP v1 with old magic |
+- 162/162 PngSuite valid PNGs round-trip byte-exact (per-file + tovyCIP archive).
+- 14/14 PngSuite intentionally-corrupt PNGs handled gracefully — no crashes, no hangs.
+- 1,500+ fuzz trials of bit-flipped / truncated / appended / fully-random `.tcip` inputs — zero AddressSanitizer errors.
+- Encode is deterministic (5× same input → identical SHA-256), and 3 concurrent encoders produce identical output (race-free).
 
 ## Targets
 
 Linux x86-64, Windows 10/11 x86-64.
 
-## Notes for Windows users
-
-The `.exe` is a **mingw-w64 cross-compiled, statically linked** binary without Authenticode signing. Some AVs may flag it as a generic heuristic (e.g. `Trojan:Win32/Wacatac`). This is a **false positive** — packPNG has no networking code and only touches the files you point it at. You can verify on [VirusTotal](https://www.virustotal.com/), or build from source on Windows.
-
-If Defender quarantines it, submit as false positive at [Microsoft's portal](https://www.microsoft.com/en-us/wdsi/filesubmission), or compile locally.
+The Windows `.exe` is a **mingw-w64 cross-compiled, statically linked** binary without Authenticode signing. Some AVs may flag it as a generic heuristic (e.g. `Trojan:Win32/Wacatac`) — **false positive**. Verify on [VirusTotal](https://www.virustotal.com/) or build from source. If Defender quarantines it, submit as false positive at [Microsoft's portal](https://www.microsoft.com/en-us/wdsi/filesubmission).
 
 ## License
 
-MIT
+MIT — see `LICENSE`.
