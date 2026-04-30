@@ -69,7 +69,7 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "c";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "d";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
 static const int   ver_major  = 1;    // v1.7 — packPNG returns to per-file recompressor (1 PNG → 1 .ppg). tovyCIP is the algorithm (kanzi RLT+BWT+SRT+ZRLT/FPAQ + zstd-19-long), used as the default backend per file. Multi-PNG inputs produce multi-PNG outputs (no archive grouping). Output collisions resolved by appending (N): image.ppg, image(1).ppg, image(2).ppg. Legacy multi-entry .tcip/.ppgs/.ppg archives still decode for back-compat.
 static const int   ver_minor  = 7;
@@ -2901,17 +2901,30 @@ static void process_file(const std::string& inpath, const std::string& src_root 
         return;
     }
     if (ft == F_TCIP) {
-        // Solid archive: extract all PNGs into outdir (or alongside the archive)
+        // Solid archive (TCIP magic): extract all entries into outdir.
+        // v1.7d: also tally stats so the final summary line works for
+        // extract operations too (input bytes = .ppg size; output bytes
+        // approximated by re-walking odir is too expensive — we track
+        // input only and bump g_processed once per archive).
         std::string odir = outdir.empty()
             ? fs::path(inpath).parent_path().string()
             : outdir;
         if (odir.empty()) odir = ".";
+        std::error_code ec;
+        uint64_t in_sz_a = (uint64_t)fs::file_size(inpath, ec);
         if (!decompress_tovycip_archive(inpath, odir)) {
             std::lock_guard<std::mutex> lk(g_print_mutex);
             clear_bar();
             fprintf(stderr, "%sERROR%s %s: %s\n",
                     col(RD), col(R), inpath.c_str(), errormessage);
             g_errors++;
+        } else {
+            g_processed++;
+            double prev = g_acc_in.load();
+            while (!g_acc_in.compare_exchange_weak(prev, prev + (double)in_sz_a)) {}
+            // Output bytes for extract are the sum of decoded PNGs — not
+            // tracked here without a directory walk. The summary line skips
+            // the ratio in decompress-only mode (see main).
         }
         std::lock_guard<std::mutex> lk(g_print_mutex);
         tick_bar();
@@ -3672,8 +3685,15 @@ int main(int argc, char** argv)
     if (module_mode) {
         fprintf(stdout, "%s %.3fs\n", errs ? "ERROR" : "OK", elapsed);
     } else if (proc > 0) {
-        double ratio = ai_d > 0 ? 100.0 * ao_d / ai_d : 0.0;
-        fprintf(stdout, "\n%i file(s)  %.2f%%  %.2fs\n", proc, ratio, elapsed);
+        // In decompress-only mode (`x`) the ratio (out/in) is the inverse
+        // of compression and isn't tracked accurately for archive extracts,
+        // so omit it. Compress mode prints the full size + ratio + time.
+        if (decompress_only) {
+            fprintf(stdout, "\n%i file(s)  %.2fs\n", proc, elapsed);
+        } else {
+            double ratio = ai_d > 0 ? 100.0 * ao_d / ai_d : 0.0;
+            fprintf(stdout, "\n%i file(s)  %.2f%%  %.2fs\n", proc, ratio, elapsed);
+        }
         if (errs > 0) fprintf(stdout, "%s%i error(s)%s\n", col(RD), errs, col(R));
     }
 
