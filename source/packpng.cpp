@@ -69,7 +69,7 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "a";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "b";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
 static const int   ver_major  = 1;    // v1.7 — packPNG returns to per-file recompressor (1 PNG → 1 .ppg). tovyCIP is the algorithm (kanzi RLT+BWT+SRT+ZRLT/FPAQ + zstd-19-long), used as the default backend per file. Multi-PNG inputs produce multi-PNG outputs (no archive grouping). Output collisions resolved by appending (N): image.ppg, image(1).ppg, image(2).ppg. Legacy multi-entry .tcip/.ppgs/.ppg archives still decode for back-compat.
 static const int   ver_minor  = 7;
@@ -3232,7 +3232,9 @@ static void show_help() {
         "  -r           recurse into subdirectories\n"
         "  -fs          preserve source folder structure under -od (use with -r)\n"
         "  -dry         dry run (no output files)\n"
-        "  -m<1-9>      LZMA preset (default 6)\n"
+        "  -m<1-9>      legacy LZMA backend (preset 1..9). Implies opt-out of\n"
+        "                 tovyCIP default → per-file zlib+LZMA (v1.0-v1.4 path).\n"
+        "                 Useful for A/B comparison vs the kanzi backend.\n"
         "  -me          LZMA extreme flag (slower, better ratio)\n"
         "  -deep        disable brute-force early-out (~2x slower, ~6%% smaller)\n"
         "  -ldf         libdeflate pixel-exact fallback for unmatched frames (PPG v5)\n"
@@ -3340,7 +3342,13 @@ int main(int argc, char** argv)
         }
         else if (arg.size() > 2 && arg.substr(0,2) == "-m") {
             int v = atoi(arg.c_str() + 2);
-            if (v >= 1 && v <= 9) g_lzma_preset = (unsigned)v;
+            if (v >= 1 && v <= 9) {
+                g_lzma_preset = (unsigned)v;
+                // v1.7b: explicit -m<N> opts out of tovyCIP auto-default and
+                // routes through the legacy per-file LZMA path (compress_png).
+                // Lets users A/B compare backends on the same corpus.
+                g_mode_explicit = true;
+            }
         }
         else if (arg.size() > 3 && arg.substr(0,3) == "-th") {
             int n = atoi(arg.c_str() + 3);
