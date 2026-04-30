@@ -69,7 +69,7 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "b";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "c";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
 static const int   ver_major  = 1;    // v1.7 — packPNG returns to per-file recompressor (1 PNG → 1 .ppg). tovyCIP is the algorithm (kanzi RLT+BWT+SRT+ZRLT/FPAQ + zstd-19-long), used as the default backend per file. Multi-PNG inputs produce multi-PNG outputs (no archive grouping). Output collisions resolved by appending (N): image.ppg, image(1).ppg, image(2).ppg. Legacy multi-entry .tcip/.ppgs/.ppg archives still decode for back-compat.
 static const int   ver_minor  = 7;
@@ -3564,6 +3564,80 @@ int main(int argc, char** argv)
             fprintf(stdout, "%d file(s)  %.2f%%  %.2fs\n", ok_count, ratio, dt);
         }
         return errors.load() > 0 ? 1 : 0;
+    }
+
+    // v1.7c: pre-filter filelist for the legacy per-file paths (-m, -zstd,
+    // -fl2, -kanzi, -kpng, -perfile) so skipped inputs don't print one line
+    // each from inside process_file. Mirrors the compact summary already used
+    // by the tovyCIP block above.
+    {
+        namespace fs = std::filesystem;
+        std::vector<CollectedFile> kept;
+        std::vector<std::string> skip_compress;    // .ppg in `a` mode
+        std::vector<std::string> skip_decompress;  // .png in `x` mode
+        std::vector<std::string> skip_bad_magic;   // file exists but magic invalid
+        std::vector<std::string> skip_missing;     // file path doesn't exist
+        for (auto& f : filelist) {
+            FileType ft = detect_type(f.path);
+            if (ft == F_PNG && decompress_only) {
+                skip_decompress.push_back(f.path);
+            } else if ((ft == F_PPG || ft == F_TCIP) && compress_only) {
+                skip_compress.push_back(f.path);
+            } else if (ft == F_UNK) {
+                std::error_code ec;
+                if (!fs::exists(f.path, ec)) skip_missing.push_back(f.path);
+                else                          skip_bad_magic.push_back(f.path);
+            } else {
+                kept.push_back(f);
+            }
+        }
+        if (!skip_compress.empty()) {
+            std::map<std::string, int> ext_counts;
+            for (auto& p : skip_compress) {
+                auto ext = fs::path(p).extension().string();
+                for (auto& c : ext) c = (char)tolower((unsigned char)c);
+                if (ext.empty()) ext = "(no ext)";
+                ext_counts[ext]++;
+            }
+            std::string breakdown;
+            for (auto& kv : ext_counts) {
+                if (!breakdown.empty()) breakdown += ", ";
+                breakdown += std::to_string(kv.second) + " " + kv.first;
+            }
+            fprintf(stderr, "%sskipped%s %zu non-PNG file(s) — %s\n",
+                    col(YL), col(R), skip_compress.size(), breakdown.c_str());
+            if (verbosity >= 1) {
+                for (auto& p : skip_compress)
+                    fprintf(stderr, "    %s\n", p.c_str());
+            }
+        }
+        if (!skip_decompress.empty()) {
+            fprintf(stderr, "%sskipped%s %zu PNG input(s) in decompress-only mode\n",
+                    col(YL), col(R), skip_decompress.size());
+            if (verbosity >= 1) {
+                for (auto& p : skip_decompress)
+                    fprintf(stderr, "    %s\n", p.c_str());
+            }
+        }
+        if (!skip_bad_magic.empty()) {
+            fprintf(stderr, "%sskipped%s %zu file(s) with invalid magic (not a PNG / .ppg)\n",
+                    col(YL), col(R), skip_bad_magic.size());
+            if (verbosity >= 1) {
+                for (auto& p : skip_bad_magic)
+                    fprintf(stderr, "    %s\n", p.c_str());
+            }
+        }
+        if (!skip_missing.empty()) {
+            fprintf(stderr, "%sERROR%s %zu missing file(s)\n",
+                    col(RD), col(R), skip_missing.size());
+            if (verbosity >= 1) {
+                for (auto& p : skip_missing)
+                    fprintf(stderr, "    %s\n", p.c_str());
+            }
+            g_errors += (int)skip_missing.size();
+        }
+        filelist = std::move(kept);
+        g_total_files = (int)filelist.size();
     }
 
     if (num_threads <= 1) {
