@@ -2168,10 +2168,10 @@ static bool kanzi_solid_dec(const uint8_t* in, size_t insz,
 #else
 static bool kanzi_solid_enc_pipe(const uint8_t*, size_t, const std::string&, const std::string&,
                                   int, int, std::vector<uint8_t>&) {
-    snprintf(errormessage, MSG_SIZE, "PPGS requires USE_KANZI"); return false;
+    snprintf(errormessage, MSG_SIZE, "tovyCIP requires USE_KANZI"); return false;
 }
 static bool kanzi_solid_dec(const uint8_t*, size_t, int, std::vector<uint8_t>&, size_t) {
-    snprintf(errormessage, MSG_SIZE, "PPGS requires USE_KANZI"); return false;
+    snprintf(errormessage, MSG_SIZE, "tovyCIP requires USE_KANZI"); return false;
 }
 #endif
 
@@ -2266,6 +2266,7 @@ static bool compress_tovycip_archive(
     // encode threads working in parallel.
     std::vector<std::vector<uint8_t>> stream_comp(NUM_STREAMS);
     std::vector<bool> stream_ok(NUM_STREAMS, true);
+    std::vector<std::string> stream_err(NUM_STREAMS);
     std::vector<uint8_t> idat_comp;
     bool idat_ok = true;
     std::vector<std::thread> px_threads;
@@ -2309,6 +2310,7 @@ static bool compress_tovycip_archive(
                                             t, e, per_stream_jobs, bs, out);
             stream_comp[s] = std::move(out);
             stream_ok[s] = ok;
+            if (!ok) stream_err[s] = errormessage;  // capture per-thread error
         });
     }
     if (!big_idat.empty()) {
@@ -2316,7 +2318,13 @@ static bool compress_tovycip_archive(
     }
     for (auto& t : px_threads) t.join();
     bool px_ok = true;
-    for (bool ok : stream_ok) if (!ok) { px_ok = false; break; }
+    for (int s = 0; s < NUM_STREAMS; s++) {
+        if (!stream_ok[s]) {
+            px_ok = false;
+            snprintf(errormessage, MSG_SIZE, "stream %d: %s", s, stream_err[s].c_str());
+            break;
+        }
+    }
     if (!px_ok || !idat_ok) return false;
 
     // PPGS v2 meta table: per entry includes a u8 stream_idx so the decoder
@@ -2391,12 +2399,12 @@ static bool decompress_tovycip_archive(
 
     // Read + decompress metadata table
     if (pos + 8 > buf.size()) {
-        snprintf(errormessage, MSG_SIZE, "PPGS truncated meta header"); return false;
+        snprintf(errormessage, MSG_SIZE, "TCIP truncated meta header"); return false;
     }
     uint32_t meta_raw  = rd_le32(buf.data() + pos); pos += 4;
     uint32_t meta_comp = rd_le32(buf.data() + pos); pos += 4;
     if (pos + meta_comp > buf.size()) {
-        snprintf(errormessage, MSG_SIZE, "PPGS truncated meta data"); return false;
+        snprintf(errormessage, MSG_SIZE, "TCIP truncated meta data"); return false;
     }
     std::vector<uint8_t> meta_table;
     if (!zstd_dec(buf.data() + pos, meta_comp, meta_table, meta_raw)) return false;
@@ -2455,35 +2463,35 @@ static bool decompress_tovycip_archive(
     int num_streams = 1;
     if (ver >= 2) {
         if (pos + 1 > buf.size()) {
-            snprintf(errormessage, MSG_SIZE, "PPGS v2 truncated num_streams"); return false;
+            snprintf(errormessage, MSG_SIZE, "TCIP truncated num_streams"); return false;
         }
         num_streams = buf[pos++];
         if (num_streams < 1 || num_streams > 16) {
-            snprintf(errormessage, MSG_SIZE, "PPGS v2 implausible num_streams=%d", num_streams); return false;
+            snprintf(errormessage, MSG_SIZE, "TCIP implausible num_streams=%d", num_streams); return false;
         }
     }
     std::vector<uint64_t> sraw(num_streams), scomp(num_streams);
     std::vector<const uint8_t*> sptr(num_streams);
     for (int s = 0; s < num_streams; s++) {
         if (pos + 16 > buf.size()) {
-            snprintf(errormessage, MSG_SIZE, "PPGS truncated px stream %d header", s); return false;
+            snprintf(errormessage, MSG_SIZE, "TCIP truncated px stream %d header", s); return false;
         }
         sraw[s]  = rd_le64(buf.data() + pos); pos += 8;
         scomp[s] = rd_le64(buf.data() + pos); pos += 8;
         if (pos + scomp[s] > buf.size()) {
-            snprintf(errormessage, MSG_SIZE, "PPGS truncated px stream %d data", s); return false;
+            snprintf(errormessage, MSG_SIZE, "TCIP truncated px stream %d data", s); return false;
         }
         sptr[s] = buf.data() + pos;
         pos += scomp[s];
     }
 
     if (pos + 16 > buf.size()) {
-        snprintf(errormessage, MSG_SIZE, "PPGS truncated idat header"); return false;
+        snprintf(errormessage, MSG_SIZE, "TCIP truncated idat header"); return false;
     }
     uint64_t big_idat_raw  = rd_le64(buf.data() + pos); pos += 8;
     uint64_t big_idat_comp = rd_le64(buf.data() + pos); pos += 8;
     if (pos + big_idat_comp > buf.size()) {
-        snprintf(errormessage, MSG_SIZE, "PPGS truncated idat data"); return false;
+        snprintf(errormessage, MSG_SIZE, "TCIP truncated idat data"); return false;
     }
     const uint8_t* big_idat_ptr = buf.data() + pos;
 
@@ -2494,27 +2502,40 @@ static bool decompress_tovycip_archive(
     std::vector<std::vector<uint8_t>> stream_buf(num_streams);
     std::vector<bool> stream_ok(num_streams, true);
     std::vector<std::thread> px_threads;
+    // Capture each worker's thread_local errormessage so main can report the
+    // actual cause (otherwise the parent's errormessage stays at default
+    // "no error" since errormessage is thread_local).
+    std::vector<std::string> stream_err(num_streams);
     for (int s = 0; s < num_streams; s++) {
         if (sraw[s] == 0) continue;
         px_threads.emplace_back([&, s] {
-            // Stream 0 (biggest, blk=1MB → multiple blocks): jobs=4 internal
-            //   parallelizes blocks across cores → fast decode.
-            // Stream 1 (smaller, blk=4MB → 1-2 blocks): jobs=2 enough.
             int per_stream_jobs = (num_streams >= 2 && s == 0) ? 4
                                 : (num_streams >= 2)            ? 2
                                                                 : 4;
             stream_ok[s] = kanzi_solid_dec(sptr[s], scomp[s], per_stream_jobs,
                                             stream_buf[s], (size_t)sraw[s]);
+            if (!stream_ok[s]) stream_err[s] = errormessage;
         });
     }
     std::vector<uint8_t> big_idat;
     bool idat_ok = true;
+    std::string idat_err;
     if (big_idat_raw > 0) {
         idat_ok = zstd_dec_long(big_idat_ptr, big_idat_comp, big_idat, big_idat_raw);
+        if (!idat_ok) idat_err = errormessage;
     }
     for (auto& t : px_threads) t.join();
     bool px_ok = true;
-    for (bool ok : stream_ok) if (!ok) { px_ok = false; break; }
+    for (int s = 0; s < num_streams; s++) {
+        if (!stream_ok[s]) {
+            px_ok = false;
+            snprintf(errormessage, MSG_SIZE, "stream %d: %s", s, stream_err[s].c_str());
+            break;
+        }
+    }
+    if (!idat_ok && px_ok) {
+        snprintf(errormessage, MSG_SIZE, "idat: %s", idat_err.c_str());
+    }
     if (!px_ok || !idat_ok) return false;
 
     // Reconstruct + write each PNG. Parallelize across entries — deflate re-encode
@@ -2589,6 +2610,18 @@ static void process_file(const std::string& inpath, const std::string& src_root 
     FileType ft = detect_type(inpath);
     if (ft == F_UNK) {
         std::lock_guard<std::mutex> lk(g_print_mutex);
+        clear_bar();
+        // Distinguish: doesn't exist vs exists-but-not-recognized
+        std::error_code ec;
+        if (!fs::exists(inpath, ec)) {
+            fprintf(stderr, "%sERROR%s %s: file not found\n",
+                    col(RD), col(R), inpath.c_str());
+        } else {
+            fprintf(stderr, "%sskip%s %s: not a recognized PNG / .ppg / .tcip "
+                            "(magic mismatch or empty)\n",
+                    col(YL), col(R), inpath.c_str());
+        }
+        g_errors++;
         tick_bar();
         return;
     }
@@ -2611,11 +2644,17 @@ static void process_file(const std::string& inpath, const std::string& src_root 
     }
     if (ft == F_PNG && decompress_only) {
         std::lock_guard<std::mutex> lk(g_print_mutex);
+        clear_bar();
+        fprintf(stderr, "%sskip%s %s: PNG input in decompress-only (x) mode\n",
+                col(YL), col(R), inpath.c_str());
         tick_bar();
         return;
     }
     if (ft == F_PPG && compress_only) {
         std::lock_guard<std::mutex> lk(g_print_mutex);
+        clear_bar();
+        fprintf(stderr, "%sskip%s %s: .ppg input in compress-only (a) mode\n",
+                col(YL), col(R), inpath.c_str());
         tick_bar();
         return;
     }
@@ -3103,7 +3142,21 @@ int main(int argc, char** argv)
         // Solid archive mode: batch all PNGs into one PPGS archive
         std::vector<std::string> paths;
         for (auto& f : filelist) {
-            if (detect_type(f.path) == F_PNG) paths.push_back(f.path);
+            FileType ft = detect_type(f.path);
+            if (ft == F_PNG) {
+                paths.push_back(f.path);
+            } else {
+                // Warn instead of silently skipping — input was given but won't
+                // appear in the archive.
+                std::error_code ec;
+                if (!std::filesystem::exists(f.path, ec)) {
+                    fprintf(stderr, "%sskip%s %s: file not found\n",
+                            col(YL), col(R), f.path.c_str());
+                } else {
+                    fprintf(stderr, "%sskip%s %s: not a PNG (magic mismatch)\n",
+                            col(YL), col(R), f.path.c_str());
+                }
+            }
         }
         if (paths.empty()) {
             fprintf(stderr, "%sERROR%s no PNG files to pack\n", col(RD), col(R));
