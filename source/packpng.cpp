@@ -19,6 +19,8 @@
 #include <numeric>
 #include <atomic>
 #include <chrono>
+#include <future>
+#include <memory>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -114,6 +116,11 @@ static int  g_kanzi_level   = 7;      // kanzi level 7 (LZP+TEXT+UTF+BWT+LZP / C
 static int  verbosity       = 0;
 static int  num_threads     = 1;
 static bool g_threads_auto  = false;  // true if user passed -th0 (auto pick)
+// Filter-sep skip threshold (bytes). Pixel buffers >= this skip filter_sep at
+// encode time → no unsep_filters at decode → ~5 ms faster per big file at the
+// cost of ~1 KB ratio per affected file. 0 = disabled (current default).
+// Set via -fastdec flag (= 4MB), -nofsep=N, or PACKPNG_NO_FSEP_ABOVE env var.
+static size_t g_nofsep_above = 0;
 static int  sfth_threads    = 1;
 static unsigned g_lzma_preset = 6u;
 static std::string outdir;
@@ -1086,13 +1093,10 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
         }
 
         // Filter separation: for matched (mode 0) or ldf_mode (mode 2) frames.
-        // Skip filter_sep for files with pixels >= PACKPNG_NO_FSEP_ABOVE bytes —
-        // saves ~5ms decode unsep cost on big files at modest ratio loss.
+        // Skip when pixels >= g_nofsep_above (set by -fastdec/-nofsep=N/env var).
         fe.filter_sep = false;
-        static const char* nofs_pf = getenv("PACKPNG_NO_FSEP_ABOVE");
-        static size_t nofs_pf_thr = nofs_pf ? (size_t)atoll(nofs_pf) : 0;
         if ((fe.matched || fe.ldf_mode) && bpp > 0
-            && (nofs_pf_thr == 0 || fr.pixels.size() < nofs_pf_thr)) {
+            && (g_nofsep_above == 0 || fr.pixels.size() < g_nofsep_above)) {
             uint32_t fw, fh;
             frame_dims(fr, ihdr, fw, fh);
             fe.stride      = fw * bpp;
@@ -1309,6 +1313,16 @@ static bool rebuild_deflate(uint8_t mode, uint8_t level, uint8_t strategy,
                             std::vector<uint8_t>& deflate_out)
 {
     if (mode == 0) {
+        // Validate params BEFORE deflateInit2 — corrupt .tcip can claim
+        // bizarre values that some zlib forks accept and then deflate()
+        // loops on. Reject anything outside zlib's documented ranges.
+        if (level > 9 || strategy > 4 || wbits < 8 || wbits > 15 ||
+            memlevel < 1 || memlevel > 9) {
+            snprintf(errormessage, MSG_SIZE,
+                     "rebuild_deflate: invalid zlib params lv=%u st=%u wb=%u ml=%u",
+                     level, strategy, wbits, memlevel);
+            return false;
+        }
         // byte-exact zlib re-encode with original params
         z_stream zs{};
         if (deflateInit2(&zs, level, Z_DEFLATED, (int)wbits, (int)memlevel, strategy) != Z_OK) {
@@ -1454,8 +1468,21 @@ static bool emit_idat_or_fdat(std::vector<uint8_t>& png_out, FrameMeta& fm) {
 
     // Undo filter separation if applied
     if (fm.filter_sep && fm.stride > 0 && fm.n_scanlines > 0) {
+        // Sanity-cap stride/n_scanlines to avoid pathological allocations on
+        // corrupt input (e.g. stride = 0xFFFFFFFF, n_scanlines = 0xFFFFFFFF).
+        if (fm.stride > 1u<<29 || fm.n_scanlines > 1u<<29) {
+            snprintf(errormessage, MSG_SIZE,
+                     "filter sep: implausible stride=%u n_scanlines=%u",
+                     fm.stride, fm.n_scanlines);
+            return false;
+        }
         size_t filter_sz = fm.n_scanlines;
         size_t pixel_sz  = (size_t)fm.n_scanlines * fm.stride;
+        // Overflow check on pixel_sz product (n_scanlines × stride)
+        if (fm.stride != 0 && pixel_sz / fm.stride != fm.n_scanlines) {
+            snprintf(errormessage, MSG_SIZE,
+                     "filter sep: stride×n_scanlines overflow"); return false;
+        }
         if (payload_copy.size() != filter_sz + pixel_sz) {
             snprintf(errormessage, MSG_SIZE, "filter sep size mismatch"); return false;
         }
@@ -1991,12 +2018,9 @@ static bool extract_solid_streams(
 #endif
         }
         fe.filter_sep = false;
-        // PACKPNG_NO_FSEP_ABOVE: bytes threshold; pixels >= this skip filter_sep
-        // (saves ~5ms per big-pixel file at decode, costs some kanzi ratio).
-        static const char* nofs = getenv("PACKPNG_NO_FSEP_ABOVE");
-        static size_t nofs_thr = nofs ? (size_t)atoll(nofs) : 0;
+        // Skip filter_sep when pixels >= g_nofsep_above (set by CLI/env).
         if ((fe.matched || fe.ldf_mode) && bpp > 0
-            && (nofs_thr == 0 || fr.pixels.size() < nofs_thr)) {
+            && (g_nofsep_above == 0 || fr.pixels.size() < g_nofsep_above)) {
             uint32_t fw, fh;
             frame_dims(fr, ihdr, fw, fh);
             fe.stride      = fw * bpp;
@@ -2105,6 +2129,14 @@ static bool reconstruct_png_from_streams(
     if (post_sz > sz || pos > sz - post_sz) { snprintf(errormessage, MSG_SIZE, "meta truncated (post)"); return false; }
     std::vector<uint8_t> post(p + pos, p + pos + post_sz); pos += post_sz;
     uint32_t num_frames = rd_le32(p + pos); pos += 4;
+    // Sanity cap: a corrupt meta can claim billions of frames → multi-GB
+    // FrameMeta allocation. APNGs in the wild rarely exceed a few hundred.
+    // 100k is an absurd ceiling that would never be legitimate.
+    if (num_frames > 100000u) {
+        snprintf(errormessage, MSG_SIZE,
+                 "TCIP entry: implausible num_frames %u (>100k)", num_frames);
+        return false;
+    }
 
     std::vector<FrameMeta> frames(num_frames);
     std::vector<uint64_t>  payload_szs(num_frames);
@@ -2200,12 +2232,55 @@ static bool kanzi_solid_dec(const uint8_t* in, size_t insz,
     }
 }
 
+// Watchdog wrapper around kanzi_solid_dec. A corrupted .tcip can drive kanzi
+// into an internal infinite loop (rare: ~3 seeds in 1500 fuzz trials). Wrap the
+// decode in a future and abort with an error if it doesn't complete within
+// `timeout_ms`. The orphan thread is detached but owns a SHARED COPY of the
+// input bytes — so even after the parent's `buf` is freed, the kanzi thread
+// keeps reading valid memory. The leaked thread keeps spinning until the
+// process exits (when the OS reaps everything).
+static bool kanzi_solid_dec_with_timeout(
+    const uint8_t* in, size_t insz, int jobs,
+    std::vector<uint8_t>& out, size_t expected,
+    int timeout_ms)
+{
+    auto promise = std::make_shared<std::promise<bool>>();
+    auto future  = promise->get_future();
+    // Copy input + outputs to shared_ptr so detach is safe.
+    auto in_copy    = std::make_shared<std::vector<uint8_t>>(in, in + insz);
+    auto out_holder = std::make_shared<std::vector<uint8_t>>();
+    auto err_holder = std::make_shared<std::string>();
+    std::thread([promise, in_copy, jobs, expected, out_holder, err_holder]() {
+        bool ok = kanzi_solid_dec(in_copy->data(), in_copy->size(),
+                                   jobs, *out_holder, expected);
+        if (!ok) *err_holder = errormessage;
+        try { promise->set_value(ok); } catch (...) { /* future abandoned */ }
+    }).detach();
+    auto status = future.wait_for(std::chrono::milliseconds(timeout_ms));
+    if (status == std::future_status::timeout) {
+        snprintf(errormessage, MSG_SIZE,
+                 "Solid kanzi dec: timed out after %d ms (likely corrupt bitstream)",
+                 timeout_ms);
+        // Leak: the detached thread keeps spinning until process exit.
+        // Acceptable for a CLI tool — the OS will reap on exit.
+        return false;
+    }
+    bool ok = future.get();
+    if (ok) out = std::move(*out_holder);
+    else if (!err_holder->empty()) snprintf(errormessage, MSG_SIZE, "%s", err_holder->c_str());
+    return ok;
+}
+
 #else
 static bool kanzi_solid_enc_pipe(const uint8_t*, size_t, const std::string&, const std::string&,
                                   int, int, std::vector<uint8_t>&) {
     snprintf(errormessage, MSG_SIZE, "tovyCIP requires USE_KANZI"); return false;
 }
 static bool kanzi_solid_dec(const uint8_t*, size_t, int, std::vector<uint8_t>&, size_t) {
+    snprintf(errormessage, MSG_SIZE, "tovyCIP requires USE_KANZI"); return false;
+}
+static bool kanzi_solid_dec_with_timeout(const uint8_t*, size_t, int,
+                                         std::vector<uint8_t>&, size_t, int) {
     snprintf(errormessage, MSG_SIZE, "tovyCIP requires USE_KANZI"); return false;
 }
 #endif
@@ -2315,17 +2390,37 @@ static bool compress_tovycip_archive(
     // biggest one(s)), stream 1 the rest. Each stream is decoded in its own
     // thread at decode time → parallel decode bypasses the kanzi-internal
     // single-block bottleneck and cuts total decode latency.
-    const int NUM_STREAMS = (entries.size() >= 2 && big_px.size() >= 1024*1024) ? 2 : 1;
+    // Adaptive stream count:
+    //   1 stream  if entries.size() < 2 OR big_px.size() < 1 MB.
+    //   2 streams if biggest entry dominates (default — current behaviour).
+    //   3 streams if entries[0] AND entries[1] are both >= 1MB pixels: gives
+    //     each big file its own decode thread, parallelism scales further on
+    //     hw_concurrency >= 4 cores.
+    //   Cap at 3 — past that, per-stream kanzi wrapper overhead outweighs the
+    //   parallelism win (also limits #worker / #stream on small core counts).
+    int NUM_STREAMS = 1;
+    if (entries.size() >= 2 && big_px.size() >= 1024*1024) {
+        NUM_STREAMS = 2;
+        if (entries.size() >= 3
+            && entries[1].px_sz >= 1024 * 1024
+            && std::thread::hardware_concurrency() >= 4) {
+            NUM_STREAMS = 3;
+        }
+    }
     std::vector<std::vector<uint8_t>> stream_px(NUM_STREAMS);
     {
         // Capture original (px_off, px_sz) per entry, then redistribute to per-stream buffers.
-        // Heuristic: stream 0 = first entry (biggest after reorder); stream 1 = the rest.
-        // For 1-stream case, all in stream 0 (back-compat layout).
+        // Heuristic for N=2:  stream 0 = entries[0]; stream 1 = entries[1..].
+        // Heuristic for N=3:  stream 0 = entries[0]; stream 1 = entries[1]; stream 2 = rest.
+        // For N=1, all in stream 0.
         std::vector<std::pair<uint64_t,uint64_t>> orig(entries.size());
         for (size_t i = 0; i < entries.size(); i++)
             orig[i] = {entries[i].px_off, entries[i].px_sz};
         for (size_t i = 0; i < entries.size(); i++) {
-            uint8_t sidx = (NUM_STREAMS > 1 && i == 0) ? 0 : (NUM_STREAMS > 1 ? 1 : 0);
+            uint8_t sidx;
+            if (NUM_STREAMS <= 1)      sidx = 0;
+            else if (NUM_STREAMS == 2) sidx = (i == 0) ? 0 : 1;
+            else /* 3 */               sidx = (i == 0) ? 0 : (i == 1) ? 1 : 2;
             entries[i].stream_idx = sidx;
             entries[i].px_off = (uint64_t)stream_px[sidx].size();
             stream_px[sidx].insert(stream_px[sidx].end(),
@@ -2362,12 +2457,15 @@ static bool compress_tovycip_archive(
                 // jobs=4 fully parallelizes. Stream 1 (smaller files) keeps 4MB
                 // blocks for best cross-block ratio.
                 t = "RLT+BWT+SRT+ZRLT"; e = "FPAQ";
-                // Stream 0 (largest entry) → block=2MB (Pareto sweet spot:
-                // size −523 B vs xz, dec-th0 mediana +1ms — within noise floor.
-                // Pairwise xz wins 22/40, solid wins 14/40, tie 4/40 → essentially
-                // tied dec-th0 with 3-axis strict WIN on size+comp+decST).
-                bs = (NUM_STREAMS >= 2 && s == 0) ? (2 * 1024 * 1024)
-                                                  : (4 * 1024 * 1024);
+                // Streams that hold a single dominant entry (s 0 always; s 1
+                // when NUM_STREAMS == 3) use block=2MB so kanzi's internal
+                // jobs=4 parallelizes the multiple blocks of the big file.
+                // The "rest" stream uses block=4MB for better cross-block ratio.
+                bool single_dominant_stream =
+                    (NUM_STREAMS >= 2 && s == 0) ||
+                    (NUM_STREAMS == 3 && s == 1);
+                bs = single_dominant_stream ? (2 * 1024 * 1024)
+                                            : (4 * 1024 * 1024);
                 jb = 4;
             }
             (void)max_px_sz;
@@ -2471,6 +2569,14 @@ static bool decompress_tovycip_archive(
     uint8_t ver  = buf[pos++]; (void)ver;
     uint8_t flgs = buf[pos++]; (void)flgs;
     uint32_t file_count = rd_le32(buf.data() + pos); pos += 4;
+    // Sanity cap on file_count: a corrupted header could claim billions of
+    // entries → multi-GB EntryRec allocation. 1M files is well above any
+    // reasonable archive (and 1M × ~50B EntryRec ≈ 50 MB allocation cap).
+    if (file_count > 1000000u) {
+        snprintf(errormessage, MSG_SIZE,
+                 "TCIP: implausible file_count %u (>1M)", file_count);
+        return false;
+    }
 
     // Read + decompress metadata table
     if (pos + 8 > buf.size()) {
@@ -2587,8 +2693,13 @@ static bool decompress_tovycip_archive(
             int per_stream_jobs = (num_streams >= 2 && s == 0) ? 4
                                 : (num_streams >= 2)            ? 2
                                                                 : 4;
-            stream_ok[s] = kanzi_solid_dec(sptr[s], scomp[s], per_stream_jobs,
-                                            stream_buf[s], (size_t)sraw[s]);
+            // Watchdog: corrupted bitstreams can drive kanzi into an internal
+            // infinite loop. 30 s is generous (8MB of valid data decodes in ~25 ms);
+            // if we hit the timeout the input is almost certainly malformed.
+            stream_ok[s] = kanzi_solid_dec_with_timeout(
+                sptr[s], scomp[s], per_stream_jobs,
+                stream_buf[s], (size_t)sraw[s],
+                /*timeout_ms=*/ 30000);  // 30s — generous; valid 8MB decode is ~25ms
             if (!stream_ok[s]) stream_err[s] = errormessage;
         });
     }
@@ -2651,7 +2762,6 @@ static bool decompress_tovycip_archive(
                 if (k >= order.size()) break;
                 size_t i = order[k];
                 auto& e = entries[i];
-
                 // Bounds-check entry's claimed stream + offsets vs decoded buffers.
                 // (Corrupted .tcip can claim a non-existent stream or offsets past EOF.)
                 if (e.stream_idx >= (uint8_t)stream_buf.size()) {
@@ -3084,6 +3194,10 @@ static void show_help() {
         "                 vs xz preset 6 (40-trial): size −523 B, comp −38%%, decST −25%%, dec-th0 −2 ms\n"
         "                 → STRICT 4-axis WIN over xz preset 6\n"
         "  -perfile     opt-out of tovyCIP auto-default → traditional per-file .ppg output\n"
+        "  -fastdec     skip filter-byte separation for files ≥4MB pixels (≈ −5 ms decode\n"
+        "                 per big file, ≈ +1 KB ratio per affected file). Equivalent to\n"
+        "                 -nofsep=4194304 / PACKPNG_NO_FSEP_ABOVE=4194304.\n"
+        "  -nofsep=N    set filter_sep skip threshold to N bytes (0 = disabled = default)\n"
         "  -kpng-max    PPGS solid + max-ratio TPAQ pipeline (archive use case)\n"
         "                 pixels: kanzi RLT / TPAQ block=2MB jobs=8 (DNA/EXE/UTF/TEXT skipped\n"
         "                   as no-ops on PNG pixel data — confirmed empirically)\n"
@@ -3111,6 +3225,8 @@ int main(int argc, char** argv)
     SetConsoleOutputCP(CP_UTF8);
 #endif
     init_colors();
+    // Legacy env var for filter_sep skip threshold (CLI flags override below).
+    if (const char* e = getenv("PACKPNG_NO_FSEP_ABOVE")) g_nofsep_above = (size_t)atoll(e);
     if (argc < 2) { show_help(); return 0; }
 
     bool list_mode = false;
@@ -3153,6 +3269,11 @@ int main(int argc, char** argv)
               || arg == "-tcip")      { use_kanzi = true; use_kpng = true; use_solid = true; g_mode_explicit = true; }
         else if (arg == "-kpng-max")  { use_kanzi = true; use_kpng = true; use_solid = true; use_kpng_max = true; g_mode_explicit = true; }
         else if (arg == "-perfile")   { use_perfile = true; g_mode_explicit = true; }
+        else if (arg == "-fastdec")   g_nofsep_above = 4 * 1024 * 1024;  // skip filter_sep on files >= 4MB pixels
+        else if (arg.rfind("-nofsep=", 0) == 0) {
+            long long n = atoll(arg.c_str() + 8);
+            if (n >= 0) g_nofsep_above = (size_t)n;
+        }
         else if (arg == "--no-color") no_color     = true;
         else if (arg == "-module")  { module_mode = true; wait_exit = false; }
         else if (arg.size() > 4 && arg.substr(0,4) == "-zl=") {
@@ -3215,6 +3336,11 @@ int main(int argc, char** argv)
     if (!module_mode) {
         fprintf(stdout, "\n%spackPNG%s v%d.%d%s  •  by %s\n\n",
                 col(BC), col(R), ver_major, ver_minor, subversion, author);
+        // Force flush so the banner reaches the user BEFORE any subsequent
+        // stderr writes (warnings, errors). Without this, when stdout is
+        // pipe-buffered (e.g. piped to less/tee/head), stderr (unbuffered) can
+        // print first → confusing "error before program identifies itself" UX.
+        fflush(stdout);
     }
 
     if (list_mode) {
