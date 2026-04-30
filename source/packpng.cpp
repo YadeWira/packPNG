@@ -2218,16 +2218,56 @@ static bool compress_tovycip_archive(
     std::vector<SolidEntry> entries;
     std::vector<uint8_t> big_px, big_idat;
 
-    for (const auto& path : png_paths) {
-        auto png_buf = read_file(path);
-        if (png_buf.empty()) continue;
+    // Parallel extract: each PNG's brute-force zlib param match + filter
+    // separation is CPU-heavy (~10-50 ms per file). Process them in parallel
+    // into per-entry local buffers; concat afterward in a sequential pass.
+    struct ExtractWork {
+        std::string path;
+        std::string name;
+        std::vector<uint8_t> px;    // local pixel section
+        std::vector<uint8_t> idat;  // local idat section
         SolidEntry e;
-        e.name = fs::path(path).filename().string();
-        if (!extract_solid_streams(png_buf, big_px, big_idat, e)) {
-            fprintf(stderr, "%sskip%s %s: %s\n", col(YL), col(R), path.c_str(), errormessage);
+        bool ok = false;
+        std::string err;
+    };
+    std::vector<ExtractWork> works(png_paths.size());
+    for (size_t i = 0; i < png_paths.size(); i++) {
+        works[i].path = png_paths[i];
+        works[i].name = fs::path(png_paths[i]).filename().string();
+    }
+    int n_extract = (int)std::thread::hardware_concurrency();
+    if (n_extract < 1) n_extract = 1;
+    if ((size_t)n_extract > works.size()) n_extract = (int)works.size();
+    std::atomic<size_t> next_idx{0};
+    std::vector<std::thread> ext_threads;
+    for (int t = 0; t < n_extract; t++) {
+        ext_threads.emplace_back([&] {
+            for (;;) {
+                size_t i = next_idx.fetch_add(1);
+                if (i >= works.size()) break;
+                auto& w = works[i];
+                auto png_buf = read_file(w.path);
+                if (png_buf.empty()) continue;
+                w.e.name = w.name;
+                w.ok = extract_solid_streams(png_buf, w.px, w.idat, w.e);
+                if (!w.ok) w.err = errormessage;
+            }
+        });
+    }
+    for (auto& th : ext_threads) th.join();
+    // Sequential concat — preserves input order for entries.
+    for (auto& w : works) {
+        if (!w.ok) {
+            fprintf(stderr, "%sskip%s %s: %s\n", col(YL), col(R),
+                    w.path.c_str(), w.err.c_str());
             continue;
         }
-        entries.push_back(std::move(e));
+        // Adjust offsets to point into the global big_px / big_idat
+        w.e.px_off   = big_px.size();
+        w.e.idat_off = big_idat.size();
+        big_px.insert(big_px.end(), w.px.begin(), w.px.end());
+        big_idat.insert(big_idat.end(), w.idat.begin(), w.idat.end());
+        entries.push_back(std::move(w.e));
     }
     if (entries.empty()) {
         snprintf(errormessage, MSG_SIZE, "no PNGs successfully packed"); return false;
