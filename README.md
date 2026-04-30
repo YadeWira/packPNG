@@ -1,14 +1,14 @@
 # packPNG
 
-**v1.5 — tovyCIP archive (DEFAULT for >1 PNG).** Lossless PNG/APNG recompressor with the **tovyCIP** archive format ("Tovy Compresor de Imágenes PNG"), a multi-stream solid archive that achieves a **strict 4-axis WIN over xz preset 6** on a 23-PNG test corpus (size, comp, decST, dec-th0).
+**v1.5 — tovyCIP archive (DEFAULT).** Lossless PNG/APNG recompressor built around the **tovyCIP** archive format ("Tovy Compresor de Imágenes PNG"), a multi-stream solid archive that achieves a **strict 4-axis WIN over xz preset 6** on a 23-PNG test corpus (size, comp, decST, dec-th0).
 
-> Cuando empaquetas más de un PNG, packPNG genera automáticamente un único `archive.tcip` que vence a xz en los 4 ejes. Para 1 solo PNG sigue produciendo `.ppg` per-file.
+> When you pack one or more PNGs, packPNG produces a single `.tcip` archive that beats xz on all 4 axes. Single-file output is named after the source (`image.png → image.tcip`); multi-file output is `archive.tcip`. Pass `-perfile` to fall back to the traditional per-file `.ppg` format.
 
 ## What's new in v1.5
 
 | Feature | Status |
 |---|---|
-| **tovyCIP archive** (`.tcip`, magic `TCIP`) | NEW — default when packing >1 PNG |
+| **tovyCIP archive** (`.tcip`, magic `TCIP`) | NEW — default for any PNG count |
 | 2-stream parallel kanzi pixel decode | NEW |
 | Auto `-th0` = `hw_concurrency - num_streams` | NEW (no thread oversubscription) |
 | Encode reorder: biggest entry → stream 0 | NEW |
@@ -109,7 +109,7 @@ Subcommands:
   l / list     inspect .ppg files
 
 tovyCIP archive flags (NEW in v1.5):
-  -tovycip     force tovyCIP archive mode (default when >1 PNG)
+  -tovycip     force tovyCIP archive mode (default for any PNG count)
   -tcip        alias of -tovycip
   -solid       legacy alias of -tovycip
   -perfile     opt out: produce traditional per-file .ppg output
@@ -142,25 +142,31 @@ General:
 
 **Examples:**
 ```bash
-packPNG a *.png                         # auto-tovyCIP → archive.tcip
-packPNG a image.png                     # single file → image.ppg
+packPNG a image.png                     # single file → image.tcip (1-entry archive)
+packPNG a *.png                         # multi  → archive.tcip
 packPNG a -tcip *.png                   # explicit tovyCIP
-packPNG a -perfile *.png                # force traditional .ppg per file
+packPNG a -perfile image.png            # legacy → image.ppg
+packPNG a -perfile *.png                # legacy → N .ppg files
 packPNG a -kpng-max *.png               # max ratio (TPAQ), slower decode
 packPNG a -ver -o image.png             # compress, verify, overwrite
 packPNG a -th0 -od out/ *.png           # auto-thread batch to directory
-packPNG x archive.tcip                  # decompress tovyCIP archive
+packPNG x image.tcip                    # decompress tovyCIP archive
 packPNG x archive.ppgs                  # legacy archive (still works)
 packPNG l image.ppg                     # inspect a per-file .ppg
 ```
+
+> **Surprise win for single-file:** for the test PNG `Cspeed.png` (~70 KB raw),
+> the 1-entry `.tcip` is **2,292 bytes smaller** than the legacy `.ppg` (23,185 vs 25,477) —
+> kanzi's BWT-based pipeline beats LZMA-6 even for a single file. No archive-framing
+> penalty in practice; the new default is strictly better on size, comp, and decode speed.
 
 ## File formats
 
 | Format | Magic | Use |
 |---|---|---|
-| **`.tcip`** | `TCIP` | tovyCIP archive (multi-PNG, default) |
+| **`.tcip`** | `TCIP` | tovyCIP archive (default for any PNG count) |
 | `.ppgs` | `PPGS` | legacy archive (still decoded by v1.5) |
-| `.ppg` | `PPG1` | per-file (single PNG); versions v1..v15 below |
+| `.ppg` | `PPG1` | legacy per-file (opt-in via `-perfile`); versions v1..v15 below |
 
 ### Per-file `.ppg` versions (all decodable by v1.5)
 

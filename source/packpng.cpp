@@ -3084,13 +3084,15 @@ int main(int argc, char** argv)
     g_total_files = (int)filelist.size();
     g_show_bar    = !module_mode && g_total_files > 1;
 
-    // v1.5 default: when packing >1 file and user did NOT pick a mode flag,
-    // auto-enable -solid (PPGS v2 archive). Wins all 4 axes vs xz preset 6.
-    // Single file or explicit mode → traditional per-file behavior.
+    // v1.5 default: tovyCIP archive (.tcip) for ANY PNG count when user did
+    // NOT pick a mode flag. Single file → 1-entry archive, named after source.
+    // The kanzi pipeline (RLT+BWT+SRT+ZRLT/FPAQ + zstd-19-long idat) wins comp,
+    // decST and dec-th0 vs xz preset 6 even for one file; ratio cost ≈ 150 B
+    // of archive framing overhead. Pass -perfile for the traditional .ppg path.
     {
         int n_pngs = 0;
         for (auto& f : filelist) if (detect_type(f.path) == F_PNG) n_pngs++;
-        if (!g_mode_explicit && n_pngs > 1 && (compress_only || !decompress_only)) {
+        if (!g_mode_explicit && n_pngs >= 1 && (compress_only || !decompress_only)) {
             use_kanzi = true;
             use_kpng  = true;
             use_solid = true;
@@ -3109,6 +3111,11 @@ int main(int argc, char** argv)
         }
         std::string archive_path;
         namespace fs = std::filesystem;
+        // Default archive name: for a single PNG, use the source basename
+        // (e.g. image.png → image.tcip). For multiple PNGs, use "archive.tcip".
+        std::string default_name = (paths.size() == 1)
+            ? fs::path(paths[0]).stem().string() + ".tcip"
+            : std::string("archive.tcip");
         if (!outdir.empty()) {
             // -od can be either an explicit .tcip / .ppgs file path, or a directory.
             // If it ends in either, treat as file; otherwise as directory.
@@ -3125,10 +3132,10 @@ int main(int argc, char** argv)
                 if (!pp.empty()) fs::create_directories(pp, rec);
             } else {
                 fs::create_directories(outdir);
-                archive_path = (fs::path(outdir) / "archive.tcip").string();
+                archive_path = (fs::path(outdir) / default_name).string();
             }
         } else {
-            archive_path = "archive.tcip";
+            archive_path = default_name;
         }
         if (!compress_tovycip_archive(paths, archive_path)) {
             fprintf(stderr, "%sERROR%s tovyCIP encode: %s\n",
