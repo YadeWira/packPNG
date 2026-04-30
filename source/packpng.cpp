@@ -31,6 +31,7 @@
 #include <streambuf>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include <zlib.h>
@@ -67,10 +68,10 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "b";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "";   // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   ver_major  = 1;    // v1.6 — unified .ppg extension. tovyCIP remains the default algorithm; archives now write .ppg instead of .tcip. Per-file packPNG mode (-perfile) also writes .ppg. Decoder dispatches by magic byte (PPG1=single, TCIP/PPGS=archive). Legacy .tcip / .ppgs files still decode.
-static const int   ver_minor  = 6;
+static const int   ver_major  = 1;    // v1.7 — packPNG returns to per-file recompressor (1 PNG → 1 .ppg). tovyCIP is the algorithm (kanzi RLT+BWT+SRT+ZRLT/FPAQ + zstd-19-long), used as the default backend per file. Multi-PNG inputs produce multi-PNG outputs (no archive grouping). Output collisions resolved by appending (N): image.ppg, image(1).ppg, image(2).ppg. Legacy multi-entry .tcip/.ppgs/.ppg archives still decode for back-compat.
+static const int   ver_minor  = 7;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
 
@@ -1881,6 +1882,38 @@ static std::string replace_ext(const std::string& path, const std::string& ext) 
     return (dot == std::string::npos ? path : path.substr(0, dot)) + ext;
 }
 
+// v1.7 collision-rename: when two inputs would produce the same outpath
+// (e.g. -r over a tree with 177× "Imagen1(1).png" in different subdirs and
+// no -fs), append "(N)" before the extension to disambiguate. Threadsafe
+// because process_file runs file-level threads.
+static std::mutex g_outpath_mutex;
+static std::unordered_set<std::string> g_outpaths_used;
+
+static std::string reserve_unique(const std::string& proposed) {
+    namespace fs = std::filesystem;
+    std::lock_guard<std::mutex> lk(g_outpath_mutex);
+    if (g_outpaths_used.find(proposed) == g_outpaths_used.end()) {
+        g_outpaths_used.insert(proposed);
+        return proposed;
+    }
+    fs::path orig(proposed);
+    std::string stem   = orig.stem().string();
+    std::string ext    = orig.extension().string();
+    fs::path    parent = orig.parent_path();
+    for (int i = 1; i < 100000; i++) {
+        std::string cand_name = stem + "(" + std::to_string(i) + ")" + ext;
+        std::string cand = parent.empty()
+            ? cand_name
+            : (parent / cand_name).string();
+        if (g_outpaths_used.find(cand) == g_outpaths_used.end()) {
+            g_outpaths_used.insert(cand);
+            return cand;
+        }
+    }
+    g_outpaths_used.insert(proposed);
+    return proposed;
+}
+
 static std::string make_outpath(const std::string& inpath, const std::string& ext,
                                 const std::string& src_root) {
     namespace fs = std::filesystem;
@@ -1898,12 +1931,12 @@ static std::string make_outpath(const std::string& inpath, const std::string& ex
             if (!ec && !rel.empty() && rel.string() != ".") {
                 fs::path full = fs::path(outdir) / rel / base;
                 fs::create_directories(full.parent_path(), ec);
-                return full.string();
+                return reserve_unique(full.string());
             }
         }
-        return (fs::path(outdir) / base).string();
+        return reserve_unique((fs::path(outdir) / base).string());
     }
-    return (fs::path(inpath).parent_path() / base).string();
+    return reserve_unique((fs::path(inpath).parent_path() / base).string());
 }
 
 /* ─── process one file ───────────────────────────────────────────────────── */
@@ -2324,10 +2357,10 @@ static bool compress_tovycip_archive(
         if (nm.empty()) nm = fs::path(png_paths[i]).filename().string();
         works[i].name = nm;
     }
-    // Reset progress counter so the bar tracks the parallel extract phase
-    // (which dominates wallclock for big corpora). Total = number of inputs.
-    g_files_done = 0;
-    g_total_files = (int)works.size();
+    // Bar progress is owned by the outer caller (main loop in v1.7+):
+    // each invocation of compress_tovycip_archive corresponds to ONE input
+    // PNG in per-file mode, so the per-work tick_bar() that v1.6b added would
+    // double-count. Keep this encoder bar-agnostic.
     int n_extract = (int)std::thread::hardware_concurrency();
     if (n_extract < 1) n_extract = 1;
     if ((size_t)n_extract > works.size()) n_extract = (int)works.size();
@@ -2340,10 +2373,9 @@ static bool compress_tovycip_archive(
                 if (i >= works.size()) break;
                 auto& w = works[i];
                 auto png_buf = read_file(w.path);
-                if (png_buf.empty()) { tick_bar(); continue; }
+                if (png_buf.empty()) continue;
                 w.e.name = w.name;
                 w.ok = extract_solid_streams(png_buf, w.px, w.idat, w.e);
-                tick_bar();
                 if (!w.ok) w.err = errormessage;
             }
         });
@@ -2570,7 +2602,6 @@ static bool compress_tovycip_archive(
                 big_idat.size(), idat_comp.size(),
                 out.size());
     }
-    finish_bar();
     return write_file(out_path, out);
 }
 
@@ -3212,16 +3243,14 @@ static void show_help() {
         "                 stored idat → zstd-19 with --long=27 (cheap init, fast decode)\n"
         "                 sections encoded in parallel; decode auto-detects idat codec by magic\n"
         "                 vs xz preset 6: ratio ≈tied, comp −37%%, decST −10%%, dec-th0 +12%%\n"
-        "  -tovycip     tovyCIP — Tovy Compresor de Imágenes PNG (multi-stream archive)\n"
-        "    -tcip        DEFAULT for any input. Output: archive.ppg (.tcip alias accepted)\n"
-        "    -solid       Pixels: 2 kanzi streams in parallel (biggest entry alone in stream 0)\n"
-        "                   stream 0 RLT+BWT+SRT+ZRLT/FPAQ block=2MB jobs=4\n"
-        "                   stream 1 RLT+BWT+SRT+ZRLT/FPAQ block=4MB jobs=4\n"
-        "                 IDAT: zstd-19 long ; metadata: zstd ; per-entry stream_idx tag\n"
-        "                 decoder -th0 auto: (hw - num_streams) reconstruct workers (no oversubscription)\n"
-        "                 vs xz preset 6 (40-trial): size −523 B, comp −38%%, decST −25%%, dec-th0 −2 ms\n"
-        "                 → STRICT 4-axis WIN over xz preset 6\n"
-        "  -perfile     opt-out of tovyCIP auto-default → traditional per-file .ppg output\n"
+        "  -tovycip     tovyCIP — Tovy Compresor de Imágenes PNG (DEFAULT, per-file)\n"
+        "                 Pipeline (always per-file in v1.7+):\n"
+        "                   pixels  → kanzi RLT+BWT+SRT+ZRLT/FPAQ\n"
+        "                   stored idat → zstd-19 with --long=27\n"
+        "                 1 PNG → 1 .ppg ; if outpaths collide they are renamed\n"
+        "                   (e.g. image.ppg → image(1).ppg → image(2).ppg).\n"
+        "                 -tcip / -solid / -perfile are accepted as legacy aliases\n"
+        "                 (no-op — the v1.5/v1.6 multi-PNG archive mode was removed).\n"
         "  -fastdec     skip filter-byte separation for files ≥4MB pixels (≈ −5 ms decode\n"
         "                 per big file, ≈ +1 KB ratio per affected file). Equivalent to\n"
         "                 -nofsep=4194304 / PACKPNG_NO_FSEP_ABOVE=4194304.\n"
@@ -3382,11 +3411,12 @@ int main(int argc, char** argv)
     g_total_files = (int)filelist.size();
     g_show_bar    = !module_mode && g_total_files > 1;
 
-    // v1.5 default: tovyCIP archive (.tcip) for ANY PNG count when user did
-    // NOT pick a mode flag. Single file → 1-entry archive, named after source.
-    // The kanzi pipeline (RLT+BWT+SRT+ZRLT/FPAQ + zstd-19-long idat) wins comp,
-    // decST and dec-th0 vs xz preset 6 even for one file; ratio cost ≈ 150 B
-    // of archive framing overhead. Pass -perfile for the traditional .ppg path.
+    // v1.7 default: tovyCIP algorithm (kanzi RLT+BWT+SRT+ZRLT/FPAQ +
+    // zstd-19-long for IDAT-passthrough), applied PER-FILE. Each input PNG
+    // produces its own .ppg containing exactly 1 entry. No archive grouping —
+    // packPNG is a per-file recompressor; tovyCIP is just the backend.
+    // Output collisions in flat -od layouts are resolved by reserve_unique()
+    // appending (N) before the extension.
     {
         int n_pngs = 0;
         for (auto& f : filelist) if (detect_type(f.path) == F_PNG) n_pngs++;
@@ -3398,18 +3428,21 @@ int main(int argc, char** argv)
     }
 
     if (use_solid && (compress_only || !decompress_only)) {
-        // Solid archive mode: batch all PNGs into one PPGS archive
+        // Per-file tovyCIP: each PNG → its own .ppg via compress_tovycip_archive
+        // invoked with a 1-element path list. Threaded across files honoring
+        // -th<N> (auto when -th0). The kanzi encoder uses 4 jobs internally per
+        // file, so the file-level pool stays modest to avoid oversubscription.
+        namespace fs = std::filesystem;
+
+        // Collect PNG paths (skip + warn on non-PNG)
         std::vector<std::string> paths;
-        std::vector<std::string> src_roots;  // parallel to paths; preserves
-                                              // subdir structure inside archive
+        std::vector<std::string> src_roots;
         for (auto& f : filelist) {
             FileType ft = detect_type(f.path);
             if (ft == F_PNG) {
                 paths.push_back(f.path);
                 src_roots.push_back(f.src_root);
             } else {
-                // Warn instead of silently skipping — input was given but won't
-                // appear in the archive.
                 std::error_code ec;
                 if (!std::filesystem::exists(f.path, ec)) {
                     fprintf(stderr, "%sskip%s %s: file not found\n",
@@ -3421,50 +3454,76 @@ int main(int argc, char** argv)
             }
         }
         if (paths.empty()) {
-            fprintf(stderr, "%sERROR%s no PNG files to pack\n", col(RD), col(R));
+            fprintf(stderr, "%sERROR%s no PNG files to compress\n", col(RD), col(R));
             return 1;
         }
-        std::string archive_path;
-        namespace fs = std::filesystem;
-        // Default archive name: for a single PNG, use the source basename
-        // (e.g. image.png → image.ppg). For multiple PNGs, use "archive.ppg".
-        // v1.6: unified .ppg extension for both per-file and tovyCIP archives;
-        // decoder dispatches by magic byte (PPG1 vs TCIP/PPGS).
-        std::string default_name = (paths.size() == 1)
-            ? fs::path(paths[0]).stem().string() + ".ppg"
-            : std::string("archive.ppg");
+
+        // Reset bar so it tracks per-file completion across the pool.
+        g_files_done = 0;
+        g_total_files = (int)paths.size();
+        std::atomic<int> errors{0};
+        std::atomic<uint64_t> total_in{0}, total_out{0};
+
+        // Resolve -od into a directory (file paths are no longer meaningful for
+        // per-file mode — if -od ends in .ppg we treat it as the dir to mkdir).
         if (!outdir.empty()) {
-            // -od can be an explicit archive file path (.ppg / legacy .tcip / .ppgs)
-            // or a directory. If it ends in any recognized extension, treat as file.
-            archive_path = outdir;
-            auto ends = [&](const char* sfx, size_t n){
-                return archive_path.size() >= n &&
-                       archive_path.substr(archive_path.size()-n) == sfx;
-            };
-            bool is_archive_path = ends(".ppg", 4) || ends(".tcip", 5) || ends(".ppgs", 5);
-            if (is_archive_path) {
-                std::error_code rec;
-                fs::remove(archive_path, rec);
-                auto pp = fs::path(archive_path).parent_path();
-                if (!pp.empty()) fs::create_directories(pp, rec);
+            std::error_code ec;
+            fs::create_directories(outdir, ec);
+        }
+
+        // File-level pool. Kanzi uses 4 jobs internally per file, so cap pool
+        // size at hw_concurrency / 2 (or honor -thN if user set it).
+        int pool = (g_threads_auto || num_threads <= 0)
+            ? std::max(1, (int)std::thread::hardware_concurrency() / 2)
+            : num_threads;
+        if ((size_t)pool > paths.size()) pool = (int)paths.size();
+        std::atomic<size_t> next_idx{0};
+        std::vector<std::thread> workers;
+
+        auto encode_one = [&](size_t i) {
+            auto& path     = paths[i];
+            auto& src_root = src_roots[i];
+            std::string outpath = make_outpath(path, ".ppg", src_root);
+            std::error_code ec;
+            auto pp = fs::path(outpath).parent_path();
+            if (!pp.empty()) fs::create_directories(pp, ec);
+            std::vector<std::string> p1{path};
+            std::vector<std::string> r1{src_root};
+            uint64_t in_sz  = (uint64_t)fs::file_size(path, ec);
+            if (!compress_tovycip_archive(p1, outpath, r1)) {
+                std::lock_guard<std::mutex> lk(g_print_mutex);
+                clear_bar();
+                fprintf(stderr, "%sERROR%s %s: %s\n",
+                        col(RD), col(R), path.c_str(), errormessage);
+                errors++;
             } else {
-                fs::create_directories(outdir);
-                archive_path = (fs::path(outdir) / default_name).string();
+                uint64_t out_sz = (uint64_t)fs::file_size(outpath, ec);
+                total_in  += in_sz;
+                total_out += out_sz;
             }
-        } else {
-            archive_path = default_name;
+            tick_bar();
+        };
+
+        for (int t = 0; t < pool; t++) {
+            workers.emplace_back([&] {
+                for (;;) {
+                    size_t i = next_idx.fetch_add(1);
+                    if (i >= paths.size()) break;
+                    encode_one(i);
+                }
+            });
         }
-        if (!compress_tovycip_archive(paths, archive_path, src_roots)) {
-            fprintf(stderr, "%sERROR%s tovyCIP encode: %s\n",
-                    col(RD), col(R), errormessage);
-            return 1;
-        }
+        for (auto& th : workers) th.join();
+        finish_bar();
+
         if (verbosity >= 0) {
-            uint64_t out_sz = (uint64_t)fs::file_size(archive_path);
-            fprintf(stdout, "wrote %s (%llu bytes)\n",
-                    archive_path.c_str(), (unsigned long long)out_sz);
+            uint64_t in_b = total_in.load();
+            uint64_t out_b = total_out.load();
+            int ok_count = (int)paths.size() - errors.load();
+            double ratio = in_b > 0 ? (100.0 * out_b / in_b) : 0.0;
+            fprintf(stdout, "%d file(s)  %.2f%%\n", ok_count, ratio);
         }
-        return 0;
+        return errors.load() > 0 ? 1 : 0;
     }
 
     if (num_threads <= 1) {
