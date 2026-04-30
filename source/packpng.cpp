@@ -789,6 +789,11 @@ static bool lzma_enc(const uint8_t* in, size_t insz, std::vector<uint8_t>& out) 
 static bool lzma_dec(const uint8_t* in, size_t insz,
                      std::vector<uint8_t>& out, size_t expected)
 {
+    static const size_t MAX_RAW = 1ull << 30;  // 1 GB sanity cap
+    if (expected > MAX_RAW) {
+        snprintf(errormessage, MSG_SIZE, "LZMA decode: implausible raw size %zu (>1GB)", expected);
+        return false;
+    }
     out.resize(expected);
     size_t in_pos = 0, out_pos = 0;
     uint64_t memlim = UINT64_MAX;
@@ -832,6 +837,14 @@ static bool zstd_enc_long(const uint8_t* in, size_t insz, int level,
 }
 static bool zstd_dec_long(const uint8_t* in, size_t insz,
                           std::vector<uint8_t>& out, size_t expected) {
+    // Sanity-cap the claimed raw size — corrupted .tcip headers can claim
+    // an absurd "expected" that triggers a multi-TB allocation. 1 GB ceiling
+    // is well above any realistic PNG batch.
+    static const size_t MAX_RAW = 1ull << 30;  // 1 GB
+    if (expected > MAX_RAW) {
+        snprintf(errormessage, MSG_SIZE, "ZSTD-long decode: implausible raw size %zu (>1GB)", expected);
+        return false;
+    }
     out.resize(expected);
     ZSTD_DCtx* dctx = ZSTD_createDCtx();
     ZSTD_DCtx_setParameter(dctx, ZSTD_d_windowLogMax, 27);
@@ -844,6 +857,11 @@ static bool zstd_dec_long(const uint8_t* in, size_t insz,
 }
 static bool zstd_dec(const uint8_t* in, size_t insz,
                      std::vector<uint8_t>& out, size_t expected) {
+    static const size_t MAX_RAW = 1ull << 30;  // 1 GB sanity cap
+    if (expected > MAX_RAW) {
+        snprintf(errormessage, MSG_SIZE, "ZSTD decode: implausible raw size %zu (>1GB)", expected);
+        return false;
+    }
     out.resize(expected);
     size_t r = ZSTD_decompress(out.data(), expected, in, insz);
     if (ZSTD_isError(r)) {
@@ -892,6 +910,11 @@ static bool fl2_enc(const uint8_t* in, size_t insz, std::vector<uint8_t>& out) {
 }
 static bool fl2_dec(const uint8_t* in, size_t insz,
                     std::vector<uint8_t>& out, size_t expected) {
+    static const size_t MAX_RAW = 1ull << 30;  // 1 GB sanity cap
+    if (expected > MAX_RAW) {
+        snprintf(errormessage, MSG_SIZE, "FL2 decode: implausible raw size %zu (>1GB)", expected);
+        return false;
+    }
     out.resize(expected);
     size_t r = FL2_decompress(out.data(), expected, in, insz);
     if (FL2_isError(r)) {
@@ -960,6 +983,11 @@ namespace { struct membuf : std::streambuf {
 
 static bool kanzi_dec_pipe(const uint8_t* in, size_t insz,
                            std::vector<uint8_t>& out, size_t expected) {
+    static const size_t MAX_RAW = 1ull << 30;  // 1 GB sanity cap
+    if (expected > MAX_RAW) {
+        snprintf(errormessage, MSG_SIZE, "Kanzi decode: implausible raw size %zu (>1GB)", expected);
+        return false;
+    }
     try {
         membuf buf((const char*)in, insz);
         std::istream ss(&buf);
@@ -1368,7 +1396,7 @@ static bool read_frame_v2(const uint8_t* p, size_t sz, size_t& pos, FrameMeta& f
     if (pos + 16 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (sizes)"); return false; }
     uint64_t raw_sz  = rd_le64(p + pos); pos += 8;
     uint64_t lzma_sz = rd_le64(p + pos); pos += 8;
-    if (pos + lzma_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (lzma)"); return false; }
+    if (lzma_sz > sz || pos > sz - lzma_sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (lzma)"); return false; }
     if (!lzma_dec(p + pos, lzma_sz, fm.payload, raw_sz)) return false;
     pos += lzma_sz;
     return true;
@@ -1474,7 +1502,7 @@ static bool emit_idat_or_fdat(std::vector<uint8_t>& png_out, FrameMeta& fm) {
     size_t dpos = 0;
     for (size_t i = 0; i < fm.chunk_szs.size(); i++) {
         uint32_t csz = fm.chunk_szs[i];
-        if (dpos + csz > deflate_stream.size()) {
+        if (csz > deflate_stream.size() || dpos > deflate_stream.size() - csz) {
             snprintf(errormessage, MSG_SIZE, "deflate shorter than expected"); return false;
         }
         if (fm.uses_idat) {
@@ -1511,10 +1539,10 @@ static bool decompress_solid(const uint8_t* p, size_t sz, size_t pos,
     bool     is_apng   = (p[pos++] & 1) != 0;
     uint32_t num_plays = rd_le32(p + pos); pos += 4; (void)num_plays;
     uint64_t pre_sz    = rd_le64(p + pos); pos += 8;
-    if (pos + pre_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG solid truncated (pre)"); return false; }
+    if (pre_sz > sz || pos > sz - pre_sz) { snprintf(errormessage, MSG_SIZE, "PPG solid truncated (pre)"); return false; }
     std::vector<uint8_t> pre(p + pos, p + pos + pre_sz); pos += pre_sz;
     uint64_t post_sz = rd_le64(p + pos); pos += 8;
-    if (pos + post_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG solid truncated (post)"); return false; }
+    if (post_sz > sz || pos > sz - post_sz) { snprintf(errormessage, MSG_SIZE, "PPG solid truncated (post)"); return false; }
     std::vector<uint8_t> post(p + pos, p + pos + post_sz); pos += post_sz;
     uint32_t num_frames = rd_le32(p + pos); pos += 4;
     (void)is_apng;
@@ -1542,13 +1570,13 @@ static bool decompress_solid(const uint8_t* p, size_t sz, size_t pos,
         if (pos + 16 > sz) { snprintf(errormessage, MSG_SIZE, "PPG split truncated (px hdr)"); return false; }
         uint64_t px_raw  = rd_le64(p + pos); pos += 8;
         uint64_t px_comp = rd_le64(p + pos); pos += 8;
-        if (pos + px_comp > sz) { snprintf(errormessage, MSG_SIZE, "PPG split truncated (px data)"); return false; }
+        if (px_comp > sz || pos > sz - px_comp) { snprintf(errormessage, MSG_SIZE, "PPG split truncated (px data)"); return false; }
         const uint8_t* px_ptr = p + pos;
         pos += px_comp;
         if (pos + 16 > sz) { snprintf(errormessage, MSG_SIZE, "PPG split truncated (idat hdr)"); return false; }
         uint64_t idat_raw  = rd_le64(p + pos); pos += 8;
         uint64_t idat_comp = rd_le64(p + pos); pos += 8;
-        if (pos + idat_comp > sz) { snprintf(errormessage, MSG_SIZE, "PPG split truncated (idat data)"); return false; }
+        if (idat_comp > sz || pos > sz - idat_comp) { snprintf(errormessage, MSG_SIZE, "PPG split truncated (idat data)"); return false; }
         const uint8_t* idat_ptr = p + pos;
         pos += idat_comp;
         // Parallel decode only when BOTH sections are big enough to amortize thread spawn.
@@ -1709,10 +1737,10 @@ static bool decompress_ppg(const std::vector<uint8_t>& ppg_buf,
         bool     is_apng   = (p[pos++] & 1) != 0;
         uint32_t num_plays = rd_le32(p + pos); pos += 4; (void)num_plays;
         uint64_t pre_sz    = rd_le64(p + pos); pos += 8;
-        if (pos + pre_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG v2 truncated (pre)"); return false; }
+        if (pre_sz > sz || pos > sz - pre_sz) { snprintf(errormessage, MSG_SIZE, "PPG v2 truncated (pre)"); return false; }
         std::vector<uint8_t> pre(p + pos, p + pos + pre_sz); pos += pre_sz;
         uint64_t post_sz = rd_le64(p + pos); pos += 8;
-        if (pos + post_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG v2 truncated (post)"); return false; }
+        if (post_sz > sz || pos > sz - post_sz) { snprintf(errormessage, MSG_SIZE, "PPG v2 truncated (post)"); return false; }
         std::vector<uint8_t> post(p + pos, p + pos + post_sz); pos += post_sz;
         uint32_t num_frames = rd_le32(p + pos); pos += 4;
         (void)is_apng;
@@ -2071,10 +2099,10 @@ static bool reconstruct_png_from_streams(
     bool is_apng = (p[pos++] & 1) != 0; (void)is_apng;
     uint32_t num_plays = rd_le32(p + pos); pos += 4; (void)num_plays;
     uint64_t pre_sz = rd_le64(p + pos); pos += 8;
-    if (pos + pre_sz > sz) { snprintf(errormessage, MSG_SIZE, "meta truncated (pre)"); return false; }
+    if (pre_sz > sz || pos > sz - pre_sz) { snprintf(errormessage, MSG_SIZE, "meta truncated (pre)"); return false; }
     std::vector<uint8_t> pre(p + pos, p + pos + pre_sz); pos += pre_sz;
     uint64_t post_sz = rd_le64(p + pos); pos += 8;
-    if (pos + post_sz > sz) { snprintf(errormessage, MSG_SIZE, "meta truncated (post)"); return false; }
+    if (post_sz > sz || pos > sz - post_sz) { snprintf(errormessage, MSG_SIZE, "meta truncated (post)"); return false; }
     std::vector<uint8_t> post(p + pos, p + pos + post_sz); pos += post_sz;
     uint32_t num_frames = rd_le32(p + pos); pos += 4;
 
@@ -2094,9 +2122,11 @@ static bool reconstruct_png_from_streams(
         const uint8_t* src = from_pixel ? px_data : idat_data;
         size_t src_sz     = from_pixel ? px_size  : idat_size;
         size_t& off       = from_pixel ? px_off   : idat_off;
-        if (off + psz > src_sz) {
-            snprintf(errormessage, MSG_SIZE, "Solid payload split frame %u (%s)",
-                     i, from_pixel ? "px" : "idat"); return false;
+        // Bounds check rewritten to avoid integer overflow when psz is corrupt.
+        // (Original `off + psz > src_sz` could wrap around if psz is huge.)
+        if (psz > src_sz || off > src_sz - psz) {
+            snprintf(errormessage, MSG_SIZE, "tovyCIP payload split frame %u (%s): psz=%zu off=%zu src_sz=%zu",
+                     i, from_pixel ? "px" : "idat", psz, off, src_sz); return false;
         }
         frames[i].payload.assign(src + off, src + off + psz);
         off += psz;
@@ -2142,6 +2172,11 @@ static bool kanzi_solid_enc_pipe(const uint8_t* in, size_t insz,
 static bool kanzi_solid_dec(const uint8_t* in, size_t insz,
                              int jobs,
                              std::vector<uint8_t>& out, size_t expected) {
+    static const size_t MAX_RAW = 1ull << 30;  // 1 GB sanity cap
+    if (expected > MAX_RAW) {
+        snprintf(errormessage, MSG_SIZE, "Solid kanzi dec: implausible raw size %zu (>1GB)", expected);
+        return false;
+    }
     try {
         membuf mb((const char*)in, insz);
         std::istream ss(&mb);
@@ -2403,7 +2438,7 @@ static bool decompress_tovycip_archive(
     }
     uint32_t meta_raw  = rd_le32(buf.data() + pos); pos += 4;
     uint32_t meta_comp = rd_le32(buf.data() + pos); pos += 4;
-    if (pos + meta_comp > buf.size()) {
+    if (meta_comp > buf.size() || pos > buf.size() - meta_comp) {
         snprintf(errormessage, MSG_SIZE, "TCIP truncated meta data"); return false;
     }
     std::vector<uint8_t> meta_table;
@@ -2478,7 +2513,7 @@ static bool decompress_tovycip_archive(
         }
         sraw[s]  = rd_le64(buf.data() + pos); pos += 8;
         scomp[s] = rd_le64(buf.data() + pos); pos += 8;
-        if (pos + scomp[s] > buf.size()) {
+        if (scomp[s] > buf.size() || pos > buf.size() - scomp[s]) {
             snprintf(errormessage, MSG_SIZE, "TCIP truncated px stream %d data", s); return false;
         }
         sptr[s] = buf.data() + pos;
@@ -2490,7 +2525,7 @@ static bool decompress_tovycip_archive(
     }
     uint64_t big_idat_raw  = rd_le64(buf.data() + pos); pos += 8;
     uint64_t big_idat_comp = rd_le64(buf.data() + pos); pos += 8;
-    if (pos + big_idat_comp > buf.size()) {
+    if (big_idat_comp > buf.size() || pos > buf.size() - big_idat_comp) {
         snprintf(errormessage, MSG_SIZE, "TCIP truncated idat data"); return false;
     }
     const uint8_t* big_idat_ptr = buf.data() + pos;
@@ -2577,7 +2612,37 @@ static bool decompress_tovycip_archive(
                 size_t i = order[k];
                 auto& e = entries[i];
 
+                // Bounds-check entry's claimed stream + offsets vs decoded buffers.
+                // (Corrupted .tcip can claim a non-existent stream or offsets past EOF.)
+                if (e.stream_idx >= (uint8_t)stream_buf.size()) {
+                    std::lock_guard<std::mutex> lk(g_print_mutex);
+                    fprintf(stderr, "%sERROR%s %s: stream_idx=%u out of range (have %zu streams)\n",
+                            col(RD), col(R), e.name.c_str(),
+                            (unsigned)e.stream_idx, stream_buf.size());
+                    errors++;
+                    continue;
+                }
                 const std::vector<uint8_t>& sb = stream_buf[e.stream_idx];
+                if (e.px_sz > sb.size() || e.px_off > sb.size() - e.px_sz) {
+                    std::lock_guard<std::mutex> lk(g_print_mutex);
+                    fprintf(stderr, "%sERROR%s %s: px_off=%llu+px_sz=%llu exceeds stream %u size %zu\n",
+                            col(RD), col(R), e.name.c_str(),
+                            (unsigned long long)e.px_off,
+                            (unsigned long long)e.px_sz,
+                            (unsigned)e.stream_idx, sb.size());
+                    errors++;
+                    continue;
+                }
+                if (e.idat_sz > big_idat.size() || e.idat_off > big_idat.size() - e.idat_sz) {
+                    std::lock_guard<std::mutex> lk(g_print_mutex);
+                    fprintf(stderr, "%sERROR%s %s: idat_off=%llu+idat_sz=%llu exceeds idat size %zu\n",
+                            col(RD), col(R), e.name.c_str(),
+                            (unsigned long long)e.idat_off,
+                            (unsigned long long)e.idat_sz,
+                            big_idat.size());
+                    errors++;
+                    continue;
+                }
                 const uint8_t* px_data   = sb.data() + e.px_off;
                 const uint8_t* idat_data = big_idat.data() + e.idat_off;
                 std::vector<uint8_t> png_out;
