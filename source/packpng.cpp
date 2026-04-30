@@ -69,8 +69,8 @@
 
 static const char* subversion = "";   // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   ver_major  = 1;    // v1.5 — tovyCIP archive (default when >1 PNG, .tcip extension): 2-stream parallel kanzi + auto-th sweet spot. STRICT 4-axis WIN over xz preset 6: size −523 B, comp −38%%, decST −25%%, dec-th0 −2 ms (40-trial median). Legacy PPGS magic still accepted at decode.
-static const int   ver_minor  = 5;
+static const int   ver_major  = 1;    // v1.6 — unified .ppg extension. tovyCIP remains the default algorithm; archives now write .ppg instead of .tcip. Per-file packPNG mode (-perfile) also writes .ppg. Decoder dispatches by magic byte (PPG1=single, TCIP/PPGS=archive). Legacy .tcip / .ppgs files still decode.
+static const int   ver_minor  = 6;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
 
@@ -2832,7 +2832,7 @@ static void process_file(const std::string& inpath, const std::string& src_root 
             fprintf(stderr, "%sERROR%s %s: file not found\n",
                     col(RD), col(R), inpath.c_str());
         } else {
-            fprintf(stderr, "%sskip%s %s: not a recognized PNG / .ppg / .tcip "
+            fprintf(stderr, "%sskip%s %s: not a recognized PNG / .ppg "
                             "(magic mismatch or empty)\n",
                     col(YL), col(R), inpath.c_str());
         }
@@ -3185,7 +3185,7 @@ static void show_help() {
         "                 sections encoded in parallel; decode auto-detects idat codec by magic\n"
         "                 vs xz preset 6: ratio ≈tied, comp −37%%, decST −10%%, dec-th0 +12%%\n"
         "  -tovycip     tovyCIP — Tovy Compresor de Imágenes PNG (multi-stream archive)\n"
-        "    -tcip        DEFAULT when packing >1 PNG. Output: archive.tcip\n"
+        "    -tcip        DEFAULT for any input. Output: archive.ppg (.tcip alias accepted)\n"
         "    -solid       Pixels: 2 kanzi streams in parallel (biggest entry alone in stream 0)\n"
         "                   stream 0 RLT+BWT+SRT+ZRLT/FPAQ block=2MB jobs=4\n"
         "                   stream 1 RLT+BWT+SRT+ZRLT/FPAQ block=4MB jobs=4\n"
@@ -3396,19 +3396,21 @@ int main(int argc, char** argv)
         std::string archive_path;
         namespace fs = std::filesystem;
         // Default archive name: for a single PNG, use the source basename
-        // (e.g. image.png → image.tcip). For multiple PNGs, use "archive.tcip".
+        // (e.g. image.png → image.ppg). For multiple PNGs, use "archive.ppg".
+        // v1.6: unified .ppg extension for both per-file and tovyCIP archives;
+        // decoder dispatches by magic byte (PPG1 vs TCIP/PPGS).
         std::string default_name = (paths.size() == 1)
-            ? fs::path(paths[0]).stem().string() + ".tcip"
-            : std::string("archive.tcip");
+            ? fs::path(paths[0]).stem().string() + ".ppg"
+            : std::string("archive.ppg");
         if (!outdir.empty()) {
-            // -od can be either an explicit .tcip / .ppgs file path, or a directory.
-            // If it ends in either, treat as file; otherwise as directory.
+            // -od can be an explicit archive file path (.ppg / legacy .tcip / .ppgs)
+            // or a directory. If it ends in any recognized extension, treat as file.
             archive_path = outdir;
             auto ends = [&](const char* sfx, size_t n){
                 return archive_path.size() >= n &&
                        archive_path.substr(archive_path.size()-n) == sfx;
             };
-            bool is_archive_path = ends(".tcip", 5) || ends(".ppgs", 5);
+            bool is_archive_path = ends(".ppg", 4) || ends(".tcip", 5) || ends(".ppgs", 5);
             if (is_archive_path) {
                 std::error_code rec;
                 fs::remove(archive_path, rec);
