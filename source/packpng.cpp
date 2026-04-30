@@ -67,7 +67,7 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "";   // letra = bugfix-only; sin letra = feature
+static const char* subversion = "a";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
 static const int   ver_major  = 1;    // v1.6 — unified .ppg extension. tovyCIP remains the default algorithm; archives now write .ppg instead of .tcip. Per-file packPNG mode (-perfile) also writes .ppg. Decoder dispatches by magic byte (PPG1=single, TCIP/PPGS=archive). Legacy .tcip / .ppgs files still decode.
 static const int   ver_minor  = 6;
@@ -796,9 +796,9 @@ static bool lzma_enc(const uint8_t* in, size_t insz, std::vector<uint8_t>& out) 
 static bool lzma_dec(const uint8_t* in, size_t insz,
                      std::vector<uint8_t>& out, size_t expected)
 {
-    static const size_t MAX_RAW = 1ull << 30;  // 1 GB sanity cap
+    static const size_t MAX_RAW = 1ull << 36;  // 64 GB sanity cap (real corpora can have >1GB raw pixels)
     if (expected > MAX_RAW) {
-        snprintf(errormessage, MSG_SIZE, "LZMA decode: implausible raw size %zu (>1GB)", expected);
+        snprintf(errormessage, MSG_SIZE, "LZMA decode: implausible raw size %zu (>64GB)", expected);
         return false;
     }
     out.resize(expected);
@@ -847,9 +847,9 @@ static bool zstd_dec_long(const uint8_t* in, size_t insz,
     // Sanity-cap the claimed raw size — corrupted .tcip headers can claim
     // an absurd "expected" that triggers a multi-TB allocation. 1 GB ceiling
     // is well above any realistic PNG batch.
-    static const size_t MAX_RAW = 1ull << 30;  // 1 GB
+    static const size_t MAX_RAW = 1ull << 36;  // 64 GB
     if (expected > MAX_RAW) {
-        snprintf(errormessage, MSG_SIZE, "ZSTD-long decode: implausible raw size %zu (>1GB)", expected);
+        snprintf(errormessage, MSG_SIZE, "ZSTD-long decode: implausible raw size %zu (>64GB)", expected);
         return false;
     }
     out.resize(expected);
@@ -864,9 +864,9 @@ static bool zstd_dec_long(const uint8_t* in, size_t insz,
 }
 static bool zstd_dec(const uint8_t* in, size_t insz,
                      std::vector<uint8_t>& out, size_t expected) {
-    static const size_t MAX_RAW = 1ull << 30;  // 1 GB sanity cap
+    static const size_t MAX_RAW = 1ull << 36;  // 64 GB sanity cap (real corpora can have >1GB raw pixels)
     if (expected > MAX_RAW) {
-        snprintf(errormessage, MSG_SIZE, "ZSTD decode: implausible raw size %zu (>1GB)", expected);
+        snprintf(errormessage, MSG_SIZE, "ZSTD decode: implausible raw size %zu (>64GB)", expected);
         return false;
     }
     out.resize(expected);
@@ -917,9 +917,9 @@ static bool fl2_enc(const uint8_t* in, size_t insz, std::vector<uint8_t>& out) {
 }
 static bool fl2_dec(const uint8_t* in, size_t insz,
                     std::vector<uint8_t>& out, size_t expected) {
-    static const size_t MAX_RAW = 1ull << 30;  // 1 GB sanity cap
+    static const size_t MAX_RAW = 1ull << 36;  // 64 GB sanity cap (real corpora can have >1GB raw pixels)
     if (expected > MAX_RAW) {
-        snprintf(errormessage, MSG_SIZE, "FL2 decode: implausible raw size %zu (>1GB)", expected);
+        snprintf(errormessage, MSG_SIZE, "FL2 decode: implausible raw size %zu (>64GB)", expected);
         return false;
     }
     out.resize(expected);
@@ -990,9 +990,9 @@ namespace { struct membuf : std::streambuf {
 
 static bool kanzi_dec_pipe(const uint8_t* in, size_t insz,
                            std::vector<uint8_t>& out, size_t expected) {
-    static const size_t MAX_RAW = 1ull << 30;  // 1 GB sanity cap
+    static const size_t MAX_RAW = 1ull << 36;  // 64 GB sanity cap (real corpora can have >1GB raw pixels)
     if (expected > MAX_RAW) {
-        snprintf(errormessage, MSG_SIZE, "Kanzi decode: implausible raw size %zu (>1GB)", expected);
+        snprintf(errormessage, MSG_SIZE, "Kanzi decode: implausible raw size %zu (>64GB)", expected);
         return false;
     }
     try {
@@ -2204,9 +2204,9 @@ static bool kanzi_solid_enc_pipe(const uint8_t* in, size_t insz,
 static bool kanzi_solid_dec(const uint8_t* in, size_t insz,
                              int jobs,
                              std::vector<uint8_t>& out, size_t expected) {
-    static const size_t MAX_RAW = 1ull << 30;  // 1 GB sanity cap
+    static const size_t MAX_RAW = 1ull << 36;  // 64 GB sanity cap (real corpora can have >1GB raw pixels)
     if (expected > MAX_RAW) {
-        snprintf(errormessage, MSG_SIZE, "Solid kanzi dec: implausible raw size %zu (>1GB)", expected);
+        snprintf(errormessage, MSG_SIZE, "Solid kanzi dec: implausible raw size %zu (>64GB)", expected);
         return false;
     }
     try {
@@ -2287,7 +2287,8 @@ static bool kanzi_solid_dec_with_timeout(const uint8_t*, size_t, int,
 
 static bool compress_tovycip_archive(
     const std::vector<std::string>& png_paths,
-    const std::string& out_path)
+    const std::string& out_path,
+    const std::vector<std::string>& src_roots = {})
 {
     namespace fs = std::filesystem;
     std::vector<SolidEntry> entries;
@@ -2308,7 +2309,20 @@ static bool compress_tovycip_archive(
     std::vector<ExtractWork> works(png_paths.size());
     for (size_t i = 0; i < png_paths.size(); i++) {
         works[i].path = png_paths[i];
-        works[i].name = fs::path(png_paths[i]).filename().string();
+        // Preserve subdir structure relative to src_root when provided.
+        // Without a src_root we fall back to the basename. Stored names
+        // use '/' as separator for cross-platform portability.
+        std::string nm;
+        const std::string& sr = (i < src_roots.size()) ? src_roots[i] : std::string();
+        if (!sr.empty()) {
+            std::error_code ec;
+            auto rel = fs::relative(fs::path(png_paths[i]), fs::path(sr), ec);
+            if (!ec && !rel.empty() && rel.native().front() != '.') {
+                nm = rel.generic_string();
+            }
+        }
+        if (nm.empty()) nm = fs::path(png_paths[i]).filename().string();
+        works[i].name = nm;
     }
     int n_extract = (int)std::thread::hardware_concurrency();
     if (n_extract < 1) n_extract = 1;
@@ -2804,6 +2818,14 @@ static bool decompress_tovycip_archive(
                     continue;
                 }
                 std::string outpath = (fs::path(out_dir) / e.name).string();
+                // Recreate subdir structure carried in e.name (v1.6.1+).
+                // For legacy archives whose e.name is a basename, parent_path()
+                // is just out_dir which already exists — create_directories is
+                // a no-op then.
+                {
+                    std::error_code mkec;
+                    fs::create_directories(fs::path(outpath).parent_path(), mkec);
+                }
                 if (!write_file(outpath, png_out)) {
                     std::lock_guard<std::mutex> lk(g_print_mutex);
                     fprintf(stderr, "%sERROR%s write %s\n", col(RD), col(R), outpath.c_str());
@@ -3372,10 +3394,13 @@ int main(int argc, char** argv)
     if (use_solid && (compress_only || !decompress_only)) {
         // Solid archive mode: batch all PNGs into one PPGS archive
         std::vector<std::string> paths;
+        std::vector<std::string> src_roots;  // parallel to paths; preserves
+                                              // subdir structure inside archive
         for (auto& f : filelist) {
             FileType ft = detect_type(f.path);
             if (ft == F_PNG) {
                 paths.push_back(f.path);
+                src_roots.push_back(f.src_root);
             } else {
                 // Warn instead of silently skipping — input was given but won't
                 // appear in the archive.
@@ -3423,7 +3448,7 @@ int main(int argc, char** argv)
         } else {
             archive_path = default_name;
         }
-        if (!compress_tovycip_archive(paths, archive_path)) {
+        if (!compress_tovycip_archive(paths, archive_path, src_roots)) {
             fprintf(stderr, "%sERROR%s tovyCIP encode: %s\n",
                     col(RD), col(R), errormessage);
             return 1;
