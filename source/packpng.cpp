@@ -69,9 +69,9 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "b";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "c";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   ver_major  = 1;    // v1.8b — second bugfix on the v1.8 line. Windows 11 audit harness (audit_v18a.ps1, 8 phases × multiple cases) found that files with invalid magic (e.g. 0-byte file with .png ext, garbage bytes) were silently skipped with a warning but the program exited 0, lying to any script checking the exit code. Fixed by bumping g_errors per skip_bad_magic entry, mirroring how skip_missing has always been handled. Otherwise v1.8a passed: 162/162 PngSuite roundtrip, multi-thread deterministic, all path edges (brackets/space/special chars), big-file stress, recurse + structure preserve, output collisions all clean. Format unchanged from v1.8/v1.8a.
+static const int   ver_major  = 1;    // v1.8c — third bugfix on the v1.8 line. The "Press <enter> to quit" prompt added in v1.8a is now only shown when the console will actually close on our exit (Windows: detect via GetConsoleProcessList — fresh console from double-click vs inherited from cmd.exe). Running from an existing shell on either platform no longer prints the prompt — it was noise the whole time. Bug originally caused by v1.8a being too coarse; the fresh-console detection is what was needed all along. -np and -module bypass the prompt unconditionally as before, so scripted invocations are unchanged. Format unchanged from v1.8/v1.8a/v1.8b.
 static const int   ver_minor  = 8;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
@@ -3563,13 +3563,29 @@ static void show_help() {
 /* ─── main ───────────────────────────────────────────────────────────────── */
 
 #ifndef BUILD_LIB
-// v1.8a: every user-visible exit from main() routes through this so a
-// double-clicked .exe (or an .exe launched via shortcut on Windows) keeps
-// its console open until the user reads the help text or error message
-// and presses Enter. -np and -module both clear wait_exit so machine /
-// scripted invocations skip the prompt as before.
+// v1.8c: only show the "Press <enter> to quit" prompt when the console
+// would actually close on our exit. Detection:
+//   Windows: GetConsoleProcessList — if exactly 1 process is attached to
+//            the console, the .exe owns it (e.g. fresh window from a
+//            double-click or a shortcut). If >1, we inherited from a
+//            shell (cmd.exe, PowerShell, Windows Terminal) which keeps
+//            its prompt after we exit, so the prompt is just noise.
+//   Linux:   never own the console — terminal emulators outlive us.
+//            On Linux the prompt was always noise; v1.8c retires it.
+// -np and -module continue to bypass the prompt unconditionally for
+// scripted / machine invocations, exactly as in v1.8a/b.
+static bool console_is_fresh() {
+#ifdef _WIN32
+    DWORD procs[2];
+    DWORD count = GetConsoleProcessList(procs, 2);
+    return count == 1;
+#else
+    return false;
+#endif
+}
+
 static int wait_and_return(int code) {
-    if (wait_exit && !module_mode) {
+    if (wait_exit && !module_mode && console_is_fresh()) {
         fprintf(stdout, "\nPress <enter> to quit\n");
         getchar();
     }
