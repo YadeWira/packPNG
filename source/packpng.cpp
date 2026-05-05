@@ -69,7 +69,7 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "d";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "e";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
 static const int   ver_major  = 1;    // v1.7 — packPNG returns to per-file recompressor (1 PNG → 1 .ppg). tovyCIP is the algorithm (kanzi RLT+BWT+SRT+ZRLT/FPAQ + zstd-19-long), used as the default backend per file. Multi-PNG inputs produce multi-PNG outputs (no archive grouping). Output collisions resolved by appending (N): image.ppg, image(1).ppg, image(2).ppg. Legacy multi-entry .tcip/.ppgs/.ppg archives still decode for back-compat.
 static const int   ver_minor  = 7;
@@ -2322,7 +2322,8 @@ static bool kanzi_solid_dec_with_timeout(const uint8_t*, size_t, int,
 static bool compress_tovycip_archive(
     const std::vector<std::string>& png_paths,
     const std::string& out_path,
-    const std::vector<std::string>& src_roots = {})
+    const std::vector<std::string>& src_roots = {},
+    std::vector<uint8_t>* out_bytes = nullptr)
 {
     namespace fs = std::filesystem;
     std::vector<SolidEntry> entries;
@@ -2603,6 +2604,9 @@ static bool compress_tovycip_archive(
                 big_idat.size(), idat_comp.size(),
                 out.size());
     }
+    // v1.7e: caller-visible bytes for verify/dry-run paths.
+    if (out_bytes) { *out_bytes = std::move(out); return true; }
+    if (dry_run) return true;
     return write_file(out_path, out);
 }
 
@@ -3051,7 +3055,10 @@ static void collect(const std::string& path) {
             if (!e.is_regular_file(ec)) continue;
             auto ext = e.path().extension().string();
             for (auto& ch : ext) ch = (char)tolower((unsigned char)ch);
-            if (ext == ".png" || ext == ".apng" || ext == ".ppg")
+            // .tcip / .ppgs (legacy archive ext) included so -r picks them up;
+            // detect_type sniffs magic to dispatch.
+            if (ext == ".png" || ext == ".apng" || ext == ".ppg"
+             || ext == ".tcip" || ext == ".ppgs")
                 filelist.push_back({ e.path().string(), path });
         }
     } else {
@@ -3229,7 +3236,7 @@ static void list_ppg(const std::string& path) {
 static void show_help() {
     fprintf(stdout,
         "\n%spackPNG%s v%d.%d%s  •  by %s\n"
-        "PNG/APNG lossless recompressor — brute-force zlib match + solid LZMA\n\n"
+        "PNG/APNG lossless recompressor — tovyCIP backend (kanzi BWT + zstd-19-long)\n\n"
         "Usage: packPNG [subcommand] [flags] file(s)\n\n"
         "Subcommands:\n"
         "  a            compress only (.png/.apng → .ppg)\n"
@@ -3249,7 +3256,11 @@ static void show_help() {
         "                 tovyCIP default → per-file zlib+LZMA (v1.0-v1.4 path).\n"
         "                 Useful for A/B comparison vs the kanzi backend.\n"
         "  -me          LZMA extreme flag (slower, better ratio)\n"
-        "  -deep        disable brute-force early-out (~2x slower, ~6%% smaller)\n"
+        "  -deep        disable brute-force early-out — explores every candidate\n"
+        "                 even after consecutive misses. On modern PNG encoders\n"
+        "                 (libpng-default-ish) it's a near no-op since match is\n"
+        "                 found on candidate 0; on exotic / older encoders it can\n"
+        "                 buy a few percent at the cost of slower encode.\n"
         "  -ldf         libdeflate pixel-exact fallback for unmatched frames (PPG v5)\n"
         "  -fl2         fast-lzma2 backend (PPG v8/v9, ~2-4x faster, +1-2%% size)\n"
         "  -kanzi       kanzi BWT+CM backend (PPG v10/v11, default level 7; slow decomp)\n"
@@ -3265,18 +3276,27 @@ static void show_help() {
         "                   stored idat → zstd-19 with --long=27\n"
         "                 1 PNG → 1 .ppg ; if outpaths collide they are renamed\n"
         "                   (e.g. image.ppg → image(1).ppg → image(2).ppg).\n"
-        "                 -tcip / -solid / -perfile are accepted as legacy aliases\n"
-        "                 (no-op — the v1.5/v1.6 multi-PNG archive mode was removed).\n"
+        "  -tcip        alias of -tovycip (no behavioural difference).\n"
+        "  -solid       alias of -tovycip (legacy name from the v1.5/v1.6 archive\n"
+        "                 era; archive grouping was removed in v1.7).\n"
+        "  -perfile     opt out of the tovyCIP default and route through the\n"
+        "                 legacy per-file LZMA path (v1.0–v1.4 backend).\n"
         "  -fastdec     skip filter-byte separation for files ≥4MB pixels (≈ −5 ms decode\n"
         "                 per big file, ≈ +1 KB ratio per affected file). Equivalent to\n"
         "                 -nofsep=4194304 / PACKPNG_NO_FSEP_ABOVE=4194304.\n"
         "  -nofsep=N    set filter_sep skip threshold to N bytes (0 = disabled = default)\n"
-        "  -kpng-max    PPGS solid + max-ratio TPAQ pipeline (archive use case)\n"
+        "  -kpng-max    tovyCIP + max-ratio TPAQ entropy (per-file in v1.7+)\n"
         "                 pixels: kanzi RLT / TPAQ block=2MB jobs=8 (DNA/EXE/UTF/TEXT skipped\n"
         "                   as no-ops on PNG pixel data — confirmed empirically)\n"
-        "                 vs xz preset 6: ratio −0.52%% (8.9KB saved!), comp −33%%, dec +130ms\n"
+        "                 trade-off: best ratio (≈ −0.5%% vs xz-6 on screenshots),\n"
+        "                   slower encode (≈ −33%% throughput) and noticeably slower\n"
+        "                   decode (~+130 ms / file). Use when ratio > read latency.\n"
         "  -th<N>       N file-level threads (0=auto)\n"
-        "  -sfth        parallel brute-force + MT-LZMA within each file (4 threads, single-file mode; -th<N/4> for batch)\n"
+        "  -sfth        single-file parallelism: 4 threads inside each file —\n"
+        "                 parallel brute-force zlib match + parallel kanzi encode\n"
+        "                 (tovyCIP path) or MT-LZMA (legacy -m<N>/-perfile path).\n"
+        "                 Best for big single-file invocations; for batches combine\n"
+        "                 with -th<N/4> to keep total = N×4 ≤ hw_concurrency.\n"
         "  -od<path>    write output to directory\n"
         "  -module      machine-friendly output\n"
         "  --no-color   disable ANSI color\n\n"
@@ -3343,34 +3363,65 @@ int main(int argc, char** argv)
         else if (arg == "-kpng-max")  { use_kanzi = true; use_kpng = true; use_solid = true; use_kpng_max = true; g_mode_explicit = true; }
         else if (arg == "-perfile")   { use_perfile = true; g_mode_explicit = true; }
         else if (arg == "-fastdec")   g_nofsep_above = 4 * 1024 * 1024;  // skip filter_sep on files >= 4MB pixels
-        else if (arg.rfind("-nofsep=", 0) == 0) {
-            long long n = atoll(arg.c_str() + 8);
-            if (n >= 0) g_nofsep_above = (size_t)n;
-        }
         else if (arg == "--no-color") no_color     = true;
         else if (arg == "-module")  { module_mode = true; wait_exit = false; }
         else if (arg.size() > 4 && arg.substr(0,4) == "-zl=") {
             int v = atoi(arg.c_str() + 4);
-            if (v >= 1 && v <= 22) g_zstd_level = v;
+            if (v < 1 || v > 22) {
+                fprintf(stderr, "invalid -zl=<N>: expected 1..22, got '%s'\n",
+                        arg.c_str() + 4);
+                return 2;
+            }
+            g_zstd_level = v;
+        }
+        else if (arg.rfind("-nofsep=", 0) == 0) {
+            const char* val = arg.c_str() + 8;
+            if (!*val) {
+                fprintf(stderr, "missing value: -nofsep=<N>\n");
+                return 2;
+            }
+            char* end = nullptr;
+            long long n = strtoll(val, &end, 10);
+            if (!end || *end != '\0' || n < 0) {
+                fprintf(stderr, "invalid -nofsep=<N>: expected non-negative int, got '%s'\n", val);
+                return 2;
+            }
+            g_nofsep_above = (size_t)n;
         }
         else if (arg.size() > 2 && arg.substr(0,2) == "-m") {
-            int v = atoi(arg.c_str() + 2);
-            if (v >= 1 && v <= 9) {
-                g_lzma_preset = (unsigned)v;
-                // v1.7b: explicit -m<N> opts out of tovyCIP auto-default and
-                // routes through the legacy per-file LZMA path (compress_png).
-                // Lets users A/B compare backends on the same corpus.
-                g_mode_explicit = true;
+            // Reject non-numeric values (e.g. -mZ silently became no-op pre-v1.7e).
+            const char* val = arg.c_str() + 2;
+            char* end = nullptr;
+            long n = strtol(val, &end, 10);
+            if (!end || *end != '\0' || n < 1 || n > 9) {
+                fprintf(stderr, "invalid -m<N>: expected 1..9, got '%s'\n", val);
+                return 2;
             }
+            g_lzma_preset = (unsigned)n;
+            // v1.7b: explicit -m<N> opts out of tovyCIP auto-default and
+            // routes through the legacy per-file LZMA path (compress_png).
+            // Lets users A/B compare backends on the same corpus.
+            g_mode_explicit = true;
         }
         else if (arg.size() > 3 && arg.substr(0,3) == "-th") {
-            int n = atoi(arg.c_str() + 3);
+            const char* val = arg.c_str() + 3;
+            char* end = nullptr;
+            long n = strtol(val, &end, 10);
+            if (!end || *end != '\0' || n < 0) {
+                fprintf(stderr, "invalid -th<N>: expected non-negative int, got '%s'\n", val);
+                return 2;
+            }
             if (n == 0) {
                 g_threads_auto = true;
-                n = (int)std::thread::hardware_concurrency();
+                n = (long)std::thread::hardware_concurrency();
                 if (n < 1) n = 1;
             }
-            num_threads = n;
+            num_threads = (int)n;
+        }
+        else if (arg == "-od") {
+            // -od without glued path: clearer message than "unknown flag: -od"
+            fprintf(stderr, "missing value: -od<path> (glue the path: -od/some/dir)\n");
+            return 2;
         }
         else if (arg.size() > 3 && arg.substr(0,3) == "-od") {
             outdir = arg.substr(3);
@@ -3475,12 +3526,19 @@ int main(int argc, char** argv)
             }
         }
         // Compact skip summary by default; full list under -v1+.
+        // For a single missing file, always show the path — count alone is useless
+        // when there's only one file.
         if (!skip_not_found.empty()) {
-            fprintf(stderr, "%sskipped%s %zu missing file(s)\n",
-                    col(YL), col(R), skip_not_found.size());
-            if (verbosity >= 1) {
-                for (auto& p : skip_not_found)
-                    fprintf(stderr, "    %s\n", p.c_str());
+            if (skip_not_found.size() == 1) {
+                fprintf(stderr, "%sskipped%s missing file: %s\n",
+                        col(YL), col(R), skip_not_found[0].c_str());
+            } else {
+                fprintf(stderr, "%sskipped%s %zu missing file(s)\n",
+                        col(YL), col(R), skip_not_found.size());
+                if (verbosity >= 1) {
+                    for (auto& p : skip_not_found)
+                        fprintf(stderr, "    %s\n", p.c_str());
+                }
             }
         }
         if (!skip_not_png.empty()) {
@@ -3541,16 +3599,84 @@ int main(int argc, char** argv)
             std::vector<std::string> p1{path};
             std::vector<std::string> r1{src_root};
             uint64_t in_sz  = (uint64_t)fs::file_size(path, ec);
-            if (!compress_tovycip_archive(p1, outpath, r1)) {
+
+            // v1.7e: encode to in-memory buffer first so we can honor
+            // -ver / -dry without writing anything we don't have to.
+            std::vector<uint8_t> archive_bytes;
+            if (!compress_tovycip_archive(p1, outpath, r1, &archive_bytes)) {
                 std::lock_guard<std::mutex> lk(g_print_mutex);
                 clear_bar();
                 fprintf(stderr, "%sERROR%s %s: %s\n",
                         col(RD), col(R), path.c_str(), errormessage);
                 errors++;
-            } else {
+                tick_bar();
+                return;
+            }
+
+            // -ver: round-trip through a verify temp dir, byte/pixel-compare
+            // the extracted PNG against the original. Writes archive_bytes to
+            // a sibling .verify file (cleaned up after) so the existing
+            // path-based decompress_tovycip_archive can be reused.
+            if (verify) {
+                std::string vbase   = outpath + ".verify";
+                std::string vfile   = vbase + ".tcip";
+                std::string vdir    = vbase + ".d";
+                fs::create_directories(vdir, ec);
+                bool vok = false;
+                bool match = false;
+                if (write_file(vfile, archive_bytes)) {
+                    if (decompress_tovycip_archive(vfile, vdir)) {
+                        // The single decoded PNG lives somewhere under vdir
+                        // (basename or relative path inside vdir, depending
+                        // on src_root). Walk recursively to find it.
+                        std::error_code rec;
+                        for (auto& de : fs::recursive_directory_iterator(vdir, rec)) {
+                            if (!de.is_regular_file(rec)) continue;
+                            auto rt = read_file(de.path().string());
+                            auto orig = read_file(path);
+                            if (!rt.empty() && !orig.empty()) {
+                                match = ldf_repack
+                                    ? compare_png_pixels(rt, orig)
+                                    : (rt == orig);
+                                vok = true;
+                            }
+                            break;
+                        }
+                    }
+                }
+                std::error_code cec;
+                fs::remove_all(vdir, cec);
+                fs::remove(vfile, cec);
+                if (!vok || !match) {
+                    std::lock_guard<std::mutex> lk(g_print_mutex);
+                    clear_bar();
+                    fprintf(stderr, "%sERROR%s %s: round-trip mismatch\n",
+                            col(RD), col(R), path.c_str());
+                    errors++;
+                    tick_bar();
+                    return;
+                }
+            }
+
+            // -dry: skip the final write but keep the encode + verify side-effects.
+            if (!dry_run) {
+                if (!write_file(outpath, archive_bytes)) {
+                    std::lock_guard<std::mutex> lk(g_print_mutex);
+                    clear_bar();
+                    fprintf(stderr, "%sERROR%s %s: cannot write output\n",
+                            col(RD), col(R), path.c_str());
+                    errors++;
+                    tick_bar();
+                    return;
+                }
                 uint64_t out_sz = (uint64_t)fs::file_size(outpath, ec);
                 total_in  += in_sz;
                 total_out += out_sz;
+            } else {
+                // Dry-run: still tally totals from the in-memory buffer so
+                // the final summary line is meaningful.
+                total_in  += in_sz;
+                total_out += (uint64_t)archive_bytes.size();
             }
             tick_bar();
         };
@@ -3641,11 +3767,16 @@ int main(int argc, char** argv)
             }
         }
         if (!skip_missing.empty()) {
-            fprintf(stderr, "%sERROR%s %zu missing file(s)\n",
-                    col(RD), col(R), skip_missing.size());
-            if (verbosity >= 1) {
-                for (auto& p : skip_missing)
-                    fprintf(stderr, "    %s\n", p.c_str());
+            if (skip_missing.size() == 1) {
+                fprintf(stderr, "%sERROR%s missing file: %s\n",
+                        col(RD), col(R), skip_missing[0].c_str());
+            } else {
+                fprintf(stderr, "%sERROR%s %zu missing file(s)\n",
+                        col(RD), col(R), skip_missing.size());
+                if (verbosity >= 1) {
+                    for (auto& p : skip_missing)
+                        fprintf(stderr, "    %s\n", p.c_str());
+                }
             }
             g_errors += (int)skip_missing.size();
         }
