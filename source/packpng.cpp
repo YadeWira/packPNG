@@ -69,9 +69,9 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "a";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "b";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   ver_major  = 1;    // v1.8a — bugfix release for the v1.8 line. The Windows binary used to close its console window on the help path (no-args / empty-filelist) and on every error-return path because those returned from main() without going through the existing "Press <enter> to quit" wait. Reported by xman on encode.su. Fixed by routing every user-visible exit through a wait_and_return() helper that respects -np/-module like before.
+static const int   ver_major  = 1;    // v1.8b — second bugfix on the v1.8 line. Windows 11 audit harness (audit_v18a.ps1, 8 phases × multiple cases) found that files with invalid magic (e.g. 0-byte file with .png ext, garbage bytes) were silently skipped with a warning but the program exited 0, lying to any script checking the exit code. Fixed by bumping g_errors per skip_bad_magic entry, mirroring how skip_missing has always been handled. Otherwise v1.8a passed: 162/162 PngSuite roundtrip, multi-thread deterministic, all path edges (brackets/space/special chars), big-file stress, recurse + structure preserve, output collisions all clean. Format unchanged from v1.8/v1.8a.
 static const int   ver_minor  = 8;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
@@ -4072,6 +4072,12 @@ int main(int argc, char** argv)
                 for (auto& p : skip_bad_magic)
                     fprintf(stderr, "    %s\n", p.c_str());
             }
+            // v1.8b: bad-magic skips count as errors so exit code reflects
+            // "you asked me to process these and I couldn't". Mirrors how
+            // skip_missing is handled (line below) — without this, a script
+            // that runs `packPNG bad.png` would see exit 0 and assume success.
+            // Found by Windows 11 audit (audit_v18a.ps1, Phase 4).
+            g_errors += (int)skip_bad_magic.size();
         }
         if (!skip_missing.empty()) {
             if (skip_missing.size() == 1) {
