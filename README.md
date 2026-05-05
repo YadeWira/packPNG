@@ -1,18 +1,31 @@
 # packPNG
 
-**Lossless PNG/APNG recompressor.** When you pack any number of PNGs, the **tovyCIP** archive format beats `xz -m6` on size, encode time and decode time on real corpora — while staying byte-exact reversible to the original PNG files.
+**Lossless PNG/APNG/JNG recompressor.** Each input image gets its own `.ppg`
+output via the **tovyCIP** backend (kanzi BWT + zstd-19 with `--long=27`),
+which beats `xz -m6` on size, encode time and decode time on real PNG corpora
+— while staying byte-exact reversible to the original file.
 
 ```bash
-packPNG a image.png        # → image.ppg     (1-entry tovyCIP archive)
-packPNG a *.png            # → archive.ppg   (multi-PNG tovyCIP archive)
-packPNG x archive.ppg      # extract back to byte-exact .png files
-packPNG a -perfile *.png   # opt-out: one per-file .ppg per .png (no archive)
+packPNG a image.png        # → image.ppg     (PNG  → tovyCIP, TCIP magic)
+packPNG a animation.apng   # → animation.ppg (APNG → tovyCIP, TCIP magic)
+packPNG a image.jng        # → image.ppg     (JNG  → TCIJ wrapper)   [v1.8+]
+packPNG x image.ppg        # extract back to the original byte-exact file
+packPNG a -r -od out/ src/ # recurse, write all outputs into out/
 ```
 
-> **v1.6:** unified `.ppg` extension for all packPNG output. tovyCIP archives
-> previously written as `.tcip` are now `.ppg` too — the decoder dispatches by
-> magic byte (`PPG1` = single-file packPNG, `TCIP`/`PPGS` = tovyCIP archive).
-> Legacy `.tcip` and `.ppgs` files keep decoding without changes.
+> **v1.8:** adds JNG (JPEG Network Graphics) container support. JNG inputs are
+> parsed into 3 sections (head / image / tail), each `zstd-19` compressed, and
+> emitted as `.ppg` with internal magic `TCIJ`. Round-trip is byte-exact on the
+> sembiance JNG corpus (gray/color, IDAT/JDAA alpha, progressive). Phase 1
+> ships the wrapper format; Phase 2 will route JDAT through packJPG for a
+> ~25 % additional win on the JPEG portion.
+
+> **v1.7:** packPNG returned to a 1-input → 1-output design — multi-PNG
+> archives were removed in favour of per-file `.ppg` output. The tovyCIP
+> algorithm stayed; it just runs on each file independently now. Output
+> collisions (e.g. two `image.png` from different dirs without `-fs`) are
+> renamed `image.ppg`, `image(1).ppg`, `image(2).ppg`. Legacy multi-entry
+> `.tcip` / `.ppgs` archives from v1.4–v1.6 still decode unchanged.
 
 ## Benchmarks vs xz preset 6
 
@@ -114,19 +127,40 @@ General:
 
 ## File formats
 
-Since v1.6 every output uses the `.ppg` extension; the decoder selects the
-right path by reading the file's magic bytes, not its name.
+Every output uses the `.ppg` extension; the decoder selects the right path
+by reading the file's 4-byte magic, not its name.
 
 | Output | Magic | When you get it |
 |---|---|---|
-| **`.ppg`** | `TCIP` | **tovyCIP archive — default for any PNG count (v1.6+)** |
-| `.ppg`     | `PPG1` | Per-file packPNG (opt-in via `-perfile`) |
-| `.tcip`    | `TCIP` | Legacy tovyCIP archive name (v1.5) — still decodable |
-| `.ppgs`    | `PPGS` | Legacy archive (v1.4–v1.5pre) — still decodable |
+| **`.ppg`** | `TCIP` | **PNG/APNG → tovyCIP (default since v1.6)** |
+| **`.ppg`** | `TCIJ` | **JNG → TCIJ wrapper (v1.8+)** |
+| `.ppg`     | `PPG1` | Per-file packPNG (legacy v1.0–v1.4 path; opt-in via `-perfile`) |
+| `.tcip`    | `TCIP` | Legacy multi-entry tovyCIP archive (v1.5–v1.6) — still decodable |
+| `.ppgs`    | `PPGS` | Legacy multi-entry archive (v1.4–v1.5pre) — still decodable |
 
 The decoder accepts every historical `.ppg` version (v1..v15), every `.ppgs`
-archive, and every `.tcip` archive produced by earlier releases. Round-trip is
-byte-exact for all of them.
+archive, every `.tcip` archive produced by earlier releases, and the new
+`TCIJ` wrapper introduced in v1.8. Round-trip is byte-exact for all of them.
+
+### TCIJ wire format (v1.8, JNG inputs)
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0  | 4  | `TCIJ` magic |
+| 4  | 1  | version (= 1) |
+| 5  | 1  | flags (reserved, 0) |
+| 6  | 2  | filename_len (LE u16) |
+| 8  | N  | filename (UTF-8, original `.jng` basename) |
+| …  | 4 + 4 | head raw / comp size (LE u32) |
+| …  | H  | head bytes (zstd) — JNG chunks before the first JDAT/IDAT/JDAA/JSEP |
+| …  | 8 + 8 | image raw / comp size (LE u64) |
+| …  | I  | image bytes (zstd-19 `--long=27`) — contiguous JDAT/IDAT/JDAA/JSEP run |
+| …  | 4 + 4 | tail raw / comp size (LE u32) |
+| …  | T  | tail bytes (zstd) — post-image chunks incl. `IEND` |
+
+Reconstruction is `JNG_SIG (8 B) + head + image + tail`; original chunk
+length / type / data / CRC bytes survive untouched, so byte-exact roundtrip
+is guaranteed regardless of how the source JNG was encoded.
 
 ## Robustness
 
