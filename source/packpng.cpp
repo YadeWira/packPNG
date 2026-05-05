@@ -69,9 +69,9 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "";   // letra = bugfix-only; sin letra = feature
+static const char* subversion = "a";  // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   ver_major  = 1;    // v1.8 — adds JNG (JPEG Network Graphics) container support. JNG inputs are parsed into head/image/tail sections, each compressed with zstd-19 (--long=27 on the image section), and emitted as .ppg with TCIJ internal magic. Byte-exact roundtrip on the full sembiance corpus (gray/color, IDAT/JDAA, progressive). Phase 2 will route JDAT through packJPG for real ratio wins; Phase 1 lays the parser + wire format. PNG/APNG path unchanged from v1.7e (TCIP magic, fully back-compat).
+static const int   ver_major  = 1;    // v1.8a — bugfix release for the v1.8 line. The Windows binary used to close its console window on the help path (no-args / empty-filelist) and on every error-return path because those returned from main() without going through the existing "Press <enter> to quit" wait. Reported by xman on encode.su. Fixed by routing every user-visible exit through a wait_and_return() helper that respects -np/-module like before.
 static const int   ver_minor  = 8;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
@@ -3563,6 +3563,19 @@ static void show_help() {
 /* ─── main ───────────────────────────────────────────────────────────────── */
 
 #ifndef BUILD_LIB
+// v1.8a: every user-visible exit from main() routes through this so a
+// double-clicked .exe (or an .exe launched via shortcut on Windows) keeps
+// its console open until the user reads the help text or error message
+// and presses Enter. -np and -module both clear wait_exit so machine /
+// scripted invocations skip the prompt as before.
+static int wait_and_return(int code) {
+    if (wait_exit && !module_mode) {
+        fprintf(stdout, "\nPress <enter> to quit\n");
+        getchar();
+    }
+    return code;
+}
+
 int main(int argc, char** argv)
 {
 #ifdef _WIN32
@@ -3572,7 +3585,7 @@ int main(int argc, char** argv)
     init_colors();
     // Legacy env var for filter_sep skip threshold (CLI flags override below).
     if (const char* e = getenv("PACKPNG_NO_FSEP_ABOVE")) g_nofsep_above = (size_t)atoll(e);
-    if (argc < 2) { show_help(); return 0; }
+    if (argc < 2) { show_help(); return wait_and_return(0); }
 
     bool list_mode = false;
     int ai = 1;
@@ -3622,7 +3635,7 @@ int main(int argc, char** argv)
             if (v < 1 || v > 22) {
                 fprintf(stderr, "invalid -zl=<N>: expected 1..22, got '%s'\n",
                         arg.c_str() + 4);
-                return 2;
+                return wait_and_return(2);
             }
             g_zstd_level = v;
         }
@@ -3630,13 +3643,13 @@ int main(int argc, char** argv)
             const char* val = arg.c_str() + 8;
             if (!*val) {
                 fprintf(stderr, "missing value: -nofsep=<N>\n");
-                return 2;
+                return wait_and_return(2);
             }
             char* end = nullptr;
             long long n = strtoll(val, &end, 10);
             if (!end || *end != '\0' || n < 0) {
                 fprintf(stderr, "invalid -nofsep=<N>: expected non-negative int, got '%s'\n", val);
-                return 2;
+                return wait_and_return(2);
             }
             g_nofsep_above = (size_t)n;
         }
@@ -3647,7 +3660,7 @@ int main(int argc, char** argv)
             long n = strtol(val, &end, 10);
             if (!end || *end != '\0' || n < 1 || n > 9) {
                 fprintf(stderr, "invalid -m<N>: expected 1..9, got '%s'\n", val);
-                return 2;
+                return wait_and_return(2);
             }
             g_lzma_preset = (unsigned)n;
             // v1.7b: explicit -m<N> opts out of tovyCIP auto-default and
@@ -3661,7 +3674,7 @@ int main(int argc, char** argv)
             long n = strtol(val, &end, 10);
             if (!end || *end != '\0' || n < 0) {
                 fprintf(stderr, "invalid -th<N>: expected non-negative int, got '%s'\n", val);
-                return 2;
+                return wait_and_return(2);
             }
             if (n == 0) {
                 g_threads_auto = true;
@@ -3673,7 +3686,7 @@ int main(int argc, char** argv)
         else if (arg == "-od") {
             // -od without glued path: clearer message than "unknown flag: -od"
             fprintf(stderr, "missing value: -od<path> (glue the path: -od/some/dir)\n");
-            return 2;
+            return wait_and_return(2);
         }
         else if (arg.size() > 3 && arg.substr(0,3) == "-od") {
             outdir = arg.substr(3);
@@ -3684,7 +3697,7 @@ int main(int argc, char** argv)
             // Previously the warning was printed and the flag silently dropped,
             // so typos like `-deeP` would be ignored without affecting behavior.
             fprintf(stderr, "unknown flag: %s\n", arg.c_str());
-            return 2;
+            return wait_and_return(2);
         }
         else
             collect(arg);
@@ -3713,7 +3726,7 @@ int main(int argc, char** argv)
         }
     }
 
-    if (filelist.empty()) { show_help(); return 0; }
+    if (filelist.empty()) { show_help(); return wait_and_return(0); }
 
     if (!module_mode) {
         fprintf(stdout, "\n%spackPNG%s v%d.%d%s  •  by %s\n\n",
@@ -3727,8 +3740,7 @@ int main(int argc, char** argv)
 
     if (list_mode) {
         for (auto& f : filelist) list_ppg(f.path);
-        if (wait_exit && !module_mode) { fprintf(stdout, "\nPress <enter> to quit\n"); getchar(); }
-        return 0;
+        return wait_and_return(0);
     }
 
     auto t0 = std::chrono::steady_clock::now();
@@ -3828,7 +3840,7 @@ int main(int argc, char** argv)
         if (paths.empty()) {
             fprintf(stderr, "%sERROR%s no PNG/JNG files to compress\n",
                     col(RD), col(R));
-            return 1;
+            return wait_and_return(1);
         }
 
         // Reset bar so it tracks per-file completion across the pool.
@@ -3979,7 +3991,7 @@ int main(int argc, char** argv)
             double dt = std::chrono::duration<double>(t1 - t0).count();
             fprintf(stdout, "%d file(s)  %.2f%%  %.2fs\n", ok_count, ratio, dt);
         }
-        return errors.load() > 0 ? 1 : 0;
+        return wait_and_return(errors.load() > 0 ? 1 : 0);
     }
 
     // v1.7c: pre-filter filelist for the legacy per-file paths (-m, -zstd,
@@ -4123,7 +4135,6 @@ int main(int argc, char** argv)
         if (errs > 0) fprintf(stdout, "%s%i error(s)%s\n", col(RD), errs, col(R));
     }
 
-    if (wait_exit && !module_mode) { fprintf(stdout, "\nPress <enter> to quit\n"); getchar(); }
-    return errs ? 1 : 0;
+    return wait_and_return(errs ? 1 : 0);
 }
 #endif // !BUILD_LIB
