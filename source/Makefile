@@ -14,8 +14,10 @@ INC_FL2    = -I$(FL2_DIR)
 
 # kanzi-cpp is not in apt; build from https://github.com/flanglet/kanzi-cpp
 # and set KANZI_DIR to its repo root (we use $(KANZI_DIR)/build/libkanzi.a).
+# v1.8: kanzi target also links libzstd because the tovyCIP/TCIP IDAT
+# passthrough and the new TCIJ (JNG) wrapper both call zstd_enc_long.
 KANZI_DIR ?= /home/forum/git/Otros/kanzi-cpp
-LIBS_KANZI = -lz -llzma $(KANZI_DIR)/build/libkanzi.a -lpthread
+LIBS_KANZI = -lz -llzma -lzstd $(KANZI_DIR)/build/libkanzi.a -lpthread
 INC_KANZI  = -I$(KANZI_DIR)/src
 
 TARGET     = packPNG
@@ -59,9 +61,11 @@ zstd: $(SRC)
 fl2: $(SRC)
 	$(CXX) $(CXXFLAGS) -DUSE_FL2 $(INC_FL2) -o $(TARGET) $^ $(LIBS_FL2)
 
-# Build with kanzi support (-kanzi flag, BWT+CM, beats xz ratio at faster comp; slow decomp)
+# Build with kanzi + zstd support — this is the v1.7+/v1.8 production target.
+# Kanzi powers the tovyCIP pixel stream; zstd powers the IDAT-passthrough and
+# the new TCIJ (JNG) head/image/tail sections.
 kanzi: $(SRC)
-	$(CXX) $(CXXFLAGS) -DUSE_KANZI $(INC_KANZI) -o $(TARGET) $^ $(LIBS_KANZI)
+	$(CXX) $(CXXFLAGS) -DUSE_KANZI -DUSE_ZSTD $(INC_KANZI) -o $(TARGET) $^ $(LIBS_KANZI)
 
 asan: $(SRC)
 	$(CXX) $(CXXFLAGS) -fsanitize=address,undefined -g -o $(TARGET)_asan $^ $(LIBS)

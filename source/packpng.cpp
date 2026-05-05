@@ -69,10 +69,10 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "e";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "";   // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   ver_major  = 1;    // v1.7 — packPNG returns to per-file recompressor (1 PNG → 1 .ppg). tovyCIP is the algorithm (kanzi RLT+BWT+SRT+ZRLT/FPAQ + zstd-19-long), used as the default backend per file. Multi-PNG inputs produce multi-PNG outputs (no archive grouping). Output collisions resolved by appending (N): image.ppg, image(1).ppg, image(2).ppg. Legacy multi-entry .tcip/.ppgs/.ppg archives still decode for back-compat.
-static const int   ver_minor  = 7;
+static const int   ver_major  = 1;    // v1.8 — adds JNG (JPEG Network Graphics) container support. JNG inputs are parsed into head/image/tail sections, each compressed with zstd-19 (--long=27 on the image section), and emitted as .ppg with TCIJ internal magic. Byte-exact roundtrip on the full sembiance corpus (gray/color, IDAT/JDAA, progressive). Phase 2 will route JDAT through packJPG for real ratio wins; Phase 1 lays the parser + wire format. PNG/APNG path unchanged from v1.7e (TCIP magic, fully back-compat).
+static const int   ver_minor  = 8;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
 
@@ -83,6 +83,13 @@ static const uint8_t PPG_SIG[4] = {'P','P','G','1'};
 static const uint8_t TCIP_SIG[4] = {'T','C','I','P'};
 // Legacy magic — decoder still accepts PPGS archives from v1.4-v1.5pre.
 static const uint8_t PPGS_SIG[4] = {'P','P','G','S'};
+// JNG (JPEG Network Graphics) container support — v1.8.
+// JNG_SIG mirrors PNG_SIG but with high-bit 'J': identifies a JNG input file.
+// TCIJ_SIG is the magic for JNG-derived .ppg outputs (v1.7 TCIP for PNG; TCIJ
+// for JNG so legacy decoders fail cleanly with "bad TCIP magic" instead of
+// silently misparsing the new layout).
+static const uint8_t JNG_SIG[8]  = {0x8B,'J','N','G','\r','\n',0x1a,'\n'};
+static const uint8_t TCIJ_SIG[4] = {'T','C','I','J'};
 static const size_t  PROBE_BYTES    = 256u << 10;  // 256 KiB — covers most PNG IDATs in one probe
 static const int     MSG_SIZE       = 512;
 static       int     EARLYOUT_K     = 8;   // bail after K consecutive probe failures (-deep raises it)
@@ -1865,14 +1872,16 @@ static bool write_file(const std::string& path, const std::vector<uint8_t>& data
     return true;
 }
 
-enum FileType { F_PNG, F_PPG, F_TCIP, F_UNK };
+enum FileType { F_PNG, F_PPG, F_TCIP, F_JNG, F_TCIJ, F_UNK };
 
 static FileType detect_type(const std::string& path) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return F_UNK;
     uint8_t buf[8]; size_t n = fread(buf, 1, 8, f); fclose(f);
     if (n >= 8 && memcmp(buf, PNG_SIG, 8) == 0) return F_PNG;
+    if (n >= 8 && memcmp(buf, JNG_SIG, 8) == 0) return F_JNG;
     if (n >= 4 && memcmp(buf, TCIP_SIG, 4) == 0) return F_TCIP;
+    if (n >= 4 && memcmp(buf, TCIJ_SIG, 4) == 0) return F_TCIJ;
     if (n >= 4 && memcmp(buf, PPGS_SIG, 4) == 0) return F_TCIP;  // legacy
     if (n >= 4 && memcmp(buf, PPG_SIG, 4) == 0) return F_PPG;
     return F_UNK;
@@ -2610,6 +2619,250 @@ static bool compress_tovycip_archive(
     return write_file(out_path, out);
 }
 
+/* ─── JNG (JPEG Network Graphics) — Phase 1 container support ───────────────
+ *
+ * v1.8: parse a .jng input into 3 sections, zstd-compress each, and emit a
+ * .ppg with TCIJ_SIG. Round-trip is byte-exact: head/image/tail preserve raw
+ * chunk bytes (length+type+data+crc), so original CRCs survive untouched.
+ *
+ *   head  = bytes between JNG_SIG and the first JDAT/IDAT/JDAA/JSEP chunk
+ *   image = contiguous JDAT/IDAT/JDAA/JSEP run (any ancillary chunks
+ *           interleaved between image chunks ride along inside this block)
+ *   tail  = everything after the last image chunk, including IEND
+ *
+ * Phase 2 (future) will parse `image` further, route JDAT → packJPG, and
+ * store IDAT/JDAA separately so the JPEG stream stops being a compression
+ * dead zone (zstd can't beat JPEG entropy).
+ *
+ * Wire format (TCIJ v1):
+ *   4   TCIJ_SIG ('T','C','I','J')
+ *   1   version  (= 1)
+ *   1   flags    (reserved, 0)
+ *   2   filename_len  (LE u16)
+ *   N   filename      (UTF-8, original .jng basename — no path components)
+ *   4   head_raw      (LE u32)   ; section sizes capped at 4 GiB except image
+ *   4   head_comp     (LE u32)
+ *   H   head_comp     bytes (zstd)
+ *   8   image_raw     (LE u64)   ; image is the bulk — gets the u64 budget
+ *   8   image_comp    (LE u64)
+ *   I   image_comp    bytes (zstd-19 with --long=27)
+ *   4   tail_raw      (LE u32)
+ *   4   tail_comp     (LE u32)
+ *   T   tail_comp     bytes (zstd)
+ */
+
+static bool parse_jng_sections(
+    const std::vector<uint8_t>& jng,
+    std::vector<uint8_t>& head_out,
+    std::vector<uint8_t>& image_out,
+    std::vector<uint8_t>& tail_out)
+{
+    if (jng.size() < 8 + 12 || memcmp(jng.data(), JNG_SIG, 8) != 0) {
+        snprintf(errormessage, MSG_SIZE, "bad JNG signature");
+        return false;
+    }
+    size_t pos = 8;
+    size_t first_img_off = 0;
+    size_t last_img_end  = 0;
+    bool   seen_iend     = false;
+    while (pos + 12 <= jng.size()) {
+        uint32_t L = rd_be32(jng.data() + pos);
+        const uint8_t* type = jng.data() + pos + 4;
+        if ((uint64_t)L > (1ull << 31)) {
+            snprintf(errormessage, MSG_SIZE,
+                     "JNG chunk length too large: %u", L);
+            return false;
+        }
+        size_t total = 12 + (size_t)L;
+        if (pos + total > jng.size()) {
+            snprintf(errormessage, MSG_SIZE, "JNG chunk overflows file");
+            return false;
+        }
+        bool is_img =
+            !memcmp(type, "JDAT", 4) || !memcmp(type, "IDAT", 4) ||
+            !memcmp(type, "JDAA", 4) || !memcmp(type, "JSEP", 4);
+        if (is_img) {
+            if (first_img_off == 0) first_img_off = pos;
+            last_img_end = pos + total;
+        }
+        if (!memcmp(type, "IEND", 4)) {
+            seen_iend = true;
+            pos += total;
+            break;
+        }
+        pos += total;
+    }
+    if (!seen_iend) {
+        snprintf(errormessage, MSG_SIZE, "JNG: no IEND chunk");
+        return false;
+    }
+    if (first_img_off == 0) {
+        snprintf(errormessage, MSG_SIZE,
+                 "JNG: no JDAT/IDAT/JDAA/JSEP chunks");
+        return false;
+    }
+    head_out.assign(jng.begin() + 8,             jng.begin() + first_img_off);
+    image_out.assign(jng.begin() + first_img_off, jng.begin() + last_img_end);
+    tail_out.assign(jng.begin() + last_img_end,  jng.begin() + pos);
+    return true;
+}
+
+static bool compress_jng_to_tcij(
+    const std::string& jng_path,
+    const std::string& out_path,
+    std::vector<uint8_t>* out_bytes = nullptr)
+{
+    namespace fs = std::filesystem;
+    auto raw = read_file(jng_path);
+    if (raw.empty()) {
+        snprintf(errormessage, MSG_SIZE, "cannot read input");
+        return false;
+    }
+    std::vector<uint8_t> head, image, tail;
+    if (!parse_jng_sections(raw, head, image, tail)) return false;
+
+    std::vector<uint8_t> head_c, image_c, tail_c;
+    if (!head.empty()  && !zstd_enc(head.data(), head.size(), head_c))
+        return false;
+    if (!image.empty() && !zstd_enc_long(image.data(), image.size(), 19, image_c))
+        return false;
+    if (!tail.empty()  && !zstd_enc(tail.data(), tail.size(), tail_c))
+        return false;
+
+    std::string fname = fs::path(jng_path).filename().string();
+    if (fname.size() > 0xFFFFu) fname.resize(0xFFFFu);
+
+    std::vector<uint8_t> out;
+    wr_bytes(out, TCIJ_SIG, 4);
+    out.push_back(1);                        // version
+    out.push_back(0);                        // flags (reserved)
+    uint16_t nlen = (uint16_t)fname.size();
+    out.push_back((uint8_t)(nlen & 0xFF));
+    out.push_back((uint8_t)((nlen >> 8) & 0xFF));
+    out.insert(out.end(), fname.begin(), fname.end());
+
+    wr_le32(out, (uint32_t)head.size());
+    wr_le32(out, (uint32_t)head_c.size());
+    out.insert(out.end(), head_c.begin(), head_c.end());
+
+    wr_le64(out, (uint64_t)image.size());
+    wr_le64(out, (uint64_t)image_c.size());
+    out.insert(out.end(), image_c.begin(), image_c.end());
+
+    wr_le32(out, (uint32_t)tail.size());
+    wr_le32(out, (uint32_t)tail_c.size());
+    out.insert(out.end(), tail_c.begin(), tail_c.end());
+
+    if (verbosity >= 1) {
+        fprintf(stdout,
+                "  %sTCIJ%s %s: head=%zu->%zu image=%zu->%zu tail=%zu->%zu total->%zu\n",
+                col(BC), col(R), fname.c_str(),
+                head.size(),  head_c.size(),
+                image.size(), image_c.size(),
+                tail.size(),  tail_c.size(),
+                out.size());
+    }
+
+    if (out_bytes) { *out_bytes = std::move(out); return true; }
+    if (dry_run) return true;
+    return write_file(out_path, out);
+}
+
+static bool decompress_tcij(
+    const std::string& archive_path,
+    const std::string& out_dir)
+{
+    namespace fs = std::filesystem;
+    auto buf = read_file(archive_path);
+    // Minimum: magic(4) + ver(1) + flags(1) + namelen(2) + 3 headers(4+4+8+8+4+4 = 32)
+    if (buf.size() < 4 + 1 + 1 + 2 + 4 + 4 + 8 + 8 + 4 + 4 ||
+        memcmp(buf.data(), TCIJ_SIG, 4) != 0) {
+        snprintf(errormessage, MSG_SIZE, "bad TCIJ magic");
+        return false;
+    }
+    size_t pos = 4;
+    uint8_t ver = buf[pos++];
+    if (ver != 1) {
+        snprintf(errormessage, MSG_SIZE,
+                 "TCIJ: unsupported version %u (this build supports v1)", ver);
+        return false;
+    }
+    uint8_t flags = buf[pos++]; (void)flags;
+
+    if (pos + 2 > buf.size()) {
+        snprintf(errormessage, MSG_SIZE, "TCIJ truncated header"); return false;
+    }
+    uint16_t nlen = (uint16_t)buf[pos] | ((uint16_t)buf[pos+1] << 8);
+    pos += 2;
+    if (pos + nlen > buf.size()) {
+        snprintf(errormessage, MSG_SIZE, "TCIJ truncated filename"); return false;
+    }
+    std::string fname((const char*)buf.data() + pos, nlen);
+    pos += nlen;
+
+    auto read_section_u32 = [&](std::vector<uint8_t>& sec)->bool {
+        if (pos + 8 > buf.size()) {
+            snprintf(errormessage, MSG_SIZE, "TCIJ truncated section header");
+            return false;
+        }
+        uint32_t raw  = rd_le32(buf.data() + pos); pos += 4;
+        uint32_t comp = rd_le32(buf.data() + pos); pos += 4;
+        if (comp > buf.size() || pos > buf.size() - comp) {
+            snprintf(errormessage, MSG_SIZE, "TCIJ truncated section data");
+            return false;
+        }
+        if (raw == 0 && comp == 0) { sec.clear(); return true; }
+        if (!zstd_dec(buf.data() + pos, comp, sec, raw)) return false;
+        pos += comp;
+        return true;
+    };
+    auto read_section_u64 = [&](std::vector<uint8_t>& sec)->bool {
+        if (pos + 16 > buf.size()) {
+            snprintf(errormessage, MSG_SIZE, "TCIJ truncated image header");
+            return false;
+        }
+        uint64_t raw  = rd_le64(buf.data() + pos); pos += 8;
+        uint64_t comp = rd_le64(buf.data() + pos); pos += 8;
+        if (comp > buf.size() || pos > buf.size() - (size_t)comp) {
+            snprintf(errormessage, MSG_SIZE, "TCIJ truncated image data");
+            return false;
+        }
+        if (raw == 0 && comp == 0) { sec.clear(); return true; }
+        if (!zstd_dec_long(buf.data() + pos, (size_t)comp, sec, (size_t)raw))
+            return false;
+        pos += (size_t)comp;
+        return true;
+    };
+
+    std::vector<uint8_t> head, image, tail;
+    if (!read_section_u32(head))  return false;
+    if (!read_section_u64(image)) return false;
+    if (!read_section_u32(tail))  return false;
+
+    // Reassemble original JNG: signature + head + image + tail.
+    std::vector<uint8_t> jng;
+    wr_bytes(jng, JNG_SIG, 8);
+    jng.insert(jng.end(), head.begin(),  head.end());
+    jng.insert(jng.end(), image.begin(), image.end());
+    jng.insert(jng.end(), tail.begin(),  tail.end());
+
+    // Sanitise filename (strip path components — no traversal).
+    if (!fname.empty()) {
+        fname = fs::path(fname).filename().string();
+    }
+    if (fname.empty()) {
+        fname = fs::path(archive_path).stem().string();
+        if (fname.empty()) fname = "out";
+        fname += ".jng";
+    }
+
+    fs::path odir = out_dir.empty() ? fs::current_path() : fs::path(out_dir);
+    std::error_code ec;
+    fs::create_directories(odir, ec);
+    fs::path full = odir / fname;
+    return write_file(full.string(), jng);
+}
+
 static bool decompress_tovycip_archive(
     const std::string& archive_path,
     const std::string& out_dir)
@@ -2904,19 +3157,20 @@ static void process_file(const std::string& inpath, const std::string& src_root 
         tick_bar();
         return;
     }
-    if (ft == F_TCIP) {
-        // Solid archive (TCIP magic): extract all entries into outdir.
-        // v1.7d: also tally stats so the final summary line works for
-        // extract operations too (input bytes = .ppg size; output bytes
-        // approximated by re-walking odir is too expensive — we track
-        // input only and bump g_processed once per archive).
+    if (ft == F_TCIP || ft == F_TCIJ) {
+        // TCIP = PNG/APNG-derived solid archive; TCIJ = JNG-derived (v1.8).
+        // Both extract into outdir; both report input bytes only (output
+        // bytes for extract require a directory walk we skip).
         std::string odir = outdir.empty()
             ? fs::path(inpath).parent_path().string()
             : outdir;
         if (odir.empty()) odir = ".";
         std::error_code ec;
         uint64_t in_sz_a = (uint64_t)fs::file_size(inpath, ec);
-        if (!decompress_tovycip_archive(inpath, odir)) {
+        bool ok = (ft == F_TCIP)
+            ? decompress_tovycip_archive(inpath, odir)
+            : decompress_tcij(inpath, odir);
+        if (!ok) {
             std::lock_guard<std::mutex> lk(g_print_mutex);
             clear_bar();
             fprintf(stderr, "%sERROR%s %s: %s\n",
@@ -2926,9 +3180,6 @@ static void process_file(const std::string& inpath, const std::string& src_root 
             g_processed++;
             double prev = g_acc_in.load();
             while (!g_acc_in.compare_exchange_weak(prev, prev + (double)in_sz_a)) {}
-            // Output bytes for extract are the sum of decoded PNGs — not
-            // tracked here without a directory walk. The summary line skips
-            // the ratio in decompress-only mode (see main).
         }
         std::lock_guard<std::mutex> lk(g_print_mutex);
         tick_bar();
@@ -3056,8 +3307,9 @@ static void collect(const std::string& path) {
             auto ext = e.path().extension().string();
             for (auto& ch : ext) ch = (char)tolower((unsigned char)ch);
             // .tcip / .ppgs (legacy archive ext) included so -r picks them up;
-            // detect_type sniffs magic to dispatch.
+            // .jng added in v1.8; detect_type sniffs magic to dispatch.
             if (ext == ".png" || ext == ".apng" || ext == ".ppg"
+             || ext == ".jng"
              || ext == ".tcip" || ext == ".ppgs")
                 filelist.push_back({ e.path().string(), path });
         }
@@ -3236,11 +3488,11 @@ static void list_ppg(const std::string& path) {
 static void show_help() {
     fprintf(stdout,
         "\n%spackPNG%s v%d.%d%s  •  by %s\n"
-        "PNG/APNG lossless recompressor — tovyCIP backend (kanzi BWT + zstd-19-long)\n\n"
+        "PNG/APNG/JNG lossless recompressor — tovyCIP backend (kanzi BWT + zstd-19-long)\n\n"
         "Usage: packPNG [subcommand] [flags] file(s)\n\n"
         "Subcommands:\n"
-        "  a            compress only (.png/.apng → .ppg)\n"
-        "  x            decompress only (.ppg → .png/.apng)\n"
+        "  a            compress only (.png/.apng/.jng → .ppg)\n"
+        "  x            decompress only (.ppg → .png/.apng/.jng)\n"
         "  mix          both directions (default)\n"
         "  l / list     inspect .ppg files (no decompression)\n\n"
         "Flags:\n"
@@ -3491,9 +3743,15 @@ int main(int argc, char** argv)
     // Output collisions in flat -od layouts are resolved by reserve_unique()
     // appending (N) before the extension.
     {
-        int n_pngs = 0;
-        for (auto& f : filelist) if (detect_type(f.path) == F_PNG) n_pngs++;
-        if (!g_mode_explicit && n_pngs >= 1 && (compress_only || !decompress_only)) {
+        // v1.8: JNG inputs go through the same per-file dispatch loop as PNG
+        // (tovyCIP for PNG entries, TCIJ wrapper for JNG entries). Counting
+        // either type triggers the default tovyCIP backend.
+        int n_inputs = 0;
+        for (auto& f : filelist) {
+            FileType ft = detect_type(f.path);
+            if (ft == F_PNG || ft == F_JNG) n_inputs++;
+        }
+        if (!g_mode_explicit && n_inputs >= 1 && (compress_only || !decompress_only)) {
             use_kanzi = true;
             use_kpng  = true;
             use_solid = true;
@@ -3502,20 +3760,25 @@ int main(int argc, char** argv)
 
     if (use_solid && (compress_only || !decompress_only)) {
         // Per-file tovyCIP: each PNG → its own .ppg via compress_tovycip_archive
-        // invoked with a 1-element path list. Threaded across files honoring
-        // -th<N> (auto when -th0). The kanzi encoder uses 4 jobs internally per
-        // file, so the file-level pool stays modest to avoid oversubscription.
+        // invoked with a 1-element path list. JNG entries (v1.8+) take the
+        // TCIJ wrapper path. Threaded across files honoring -th<N> (auto when
+        // -th0). The kanzi encoder uses 4 jobs internally per file, so the
+        // file-level pool stays modest to avoid oversubscription.
         namespace fs = std::filesystem;
 
-        // Collect PNG paths (skip + warn on non-PNG)
+        // Collect PNG / JNG paths (skip + warn on the rest). We carry the
+        // file type alongside the path so encode_one can dispatch without
+        // re-sniffing the magic.
         std::vector<std::string> paths;
+        std::vector<FileType>    types;
         std::vector<std::string> src_roots;
         std::vector<std::string> skip_not_png;
         std::vector<std::string> skip_not_found;
         for (auto& f : filelist) {
             FileType ft = detect_type(f.path);
-            if (ft == F_PNG) {
+            if (ft == F_PNG || ft == F_JNG) {
                 paths.push_back(f.path);
+                types.push_back(ft);
                 src_roots.push_back(f.src_root);
             } else {
                 std::error_code ec;
@@ -3555,7 +3818,7 @@ int main(int argc, char** argv)
                 if (!breakdown.empty()) breakdown += ", ";
                 breakdown += std::to_string(kv.second) + " " + kv.first;
             }
-            fprintf(stderr, "%sskipped%s %zu non-PNG file(s) — %s\n",
+            fprintf(stderr, "%sskipped%s %zu non-PNG/JNG file(s) — %s\n",
                     col(YL), col(R), skip_not_png.size(), breakdown.c_str());
             if (verbosity >= 1) {
                 for (auto& p : skip_not_png)
@@ -3563,7 +3826,8 @@ int main(int argc, char** argv)
             }
         }
         if (paths.empty()) {
-            fprintf(stderr, "%sERROR%s no PNG files to compress\n", col(RD), col(R));
+            fprintf(stderr, "%sERROR%s no PNG/JNG files to compress\n",
+                    col(RD), col(R));
             return 1;
         }
 
@@ -3590,8 +3854,9 @@ int main(int argc, char** argv)
         std::vector<std::thread> workers;
 
         auto encode_one = [&](size_t i) {
-            auto& path     = paths[i];
-            auto& src_root = src_roots[i];
+            auto&     path     = paths[i];
+            FileType  ftype    = types[i];
+            auto&     src_root = src_roots[i];
             std::string outpath = make_outpath(path, ".ppg", src_root);
             std::error_code ec;
             auto pp = fs::path(outpath).parent_path();
@@ -3602,8 +3867,13 @@ int main(int argc, char** argv)
 
             // v1.7e: encode to in-memory buffer first so we can honor
             // -ver / -dry without writing anything we don't have to.
+            // v1.8: dispatch by file type — PNG/APNG → tovyCIP (TCIP),
+            //                              JNG     → TCIJ wrapper.
             std::vector<uint8_t> archive_bytes;
-            if (!compress_tovycip_archive(p1, outpath, r1, &archive_bytes)) {
+            bool enc_ok = (ftype == F_JNG)
+                ? compress_jng_to_tcij(path, outpath, &archive_bytes)
+                : compress_tovycip_archive(p1, outpath, r1, &archive_bytes);
+            if (!enc_ok) {
                 std::lock_guard<std::mutex> lk(g_print_mutex);
                 clear_bar();
                 fprintf(stderr, "%sERROR%s %s: %s\n",
@@ -3613,10 +3883,11 @@ int main(int argc, char** argv)
                 return;
             }
 
-            // -ver: round-trip through a verify temp dir, byte/pixel-compare
-            // the extracted PNG against the original. Writes archive_bytes to
-            // a sibling .verify file (cleaned up after) so the existing
-            // path-based decompress_tovycip_archive can be reused.
+            // -ver: round-trip through a verify temp dir, byte-compare the
+            // extracted file against the original. Writes archive_bytes to a
+            // sibling .verify file (cleaned up after) so the existing
+            // path-based decoders can be reused. JNG goes through
+            // decompress_tcij; PNG/APNG through decompress_tovycip_archive.
             if (verify) {
                 std::string vbase   = outpath + ".verify";
                 std::string vfile   = vbase + ".tcip";
@@ -3625,8 +3896,11 @@ int main(int argc, char** argv)
                 bool vok = false;
                 bool match = false;
                 if (write_file(vfile, archive_bytes)) {
-                    if (decompress_tovycip_archive(vfile, vdir)) {
-                        // The single decoded PNG lives somewhere under vdir
+                    bool dec_ok = (ftype == F_JNG)
+                        ? decompress_tcij(vfile, vdir)
+                        : decompress_tovycip_archive(vfile, vdir);
+                    if (dec_ok) {
+                        // The single decoded file lives somewhere under vdir
                         // (basename or relative path inside vdir, depending
                         // on src_root). Walk recursively to find it.
                         std::error_code rec;
@@ -3635,7 +3909,10 @@ int main(int argc, char** argv)
                             auto rt = read_file(de.path().string());
                             auto orig = read_file(path);
                             if (!rt.empty() && !orig.empty()) {
-                                match = ldf_repack
+                                // -ldf pixel-compare only applies to PNG path
+                                // (lossless re-encode of unmatched IDATs); JNG
+                                // round-trip is always byte-exact.
+                                match = (ftype != F_JNG && ldf_repack)
                                     ? compare_png_pixels(rt, orig)
                                     : (rt == orig);
                                 vok = true;
@@ -3716,12 +3993,20 @@ int main(int argc, char** argv)
         std::vector<std::string> skip_decompress;  // .png in `x` mode
         std::vector<std::string> skip_bad_magic;   // file exists but magic invalid
         std::vector<std::string> skip_missing;     // file path doesn't exist
+        std::vector<std::string> skip_jng_legacy;  // v1.8: JNG needs default backend
         for (auto& f : filelist) {
             FileType ft = detect_type(f.path);
             if (ft == F_PNG && decompress_only) {
                 skip_decompress.push_back(f.path);
-            } else if ((ft == F_PPG || ft == F_TCIP) && compress_only) {
+            } else if ((ft == F_PPG || ft == F_TCIP || ft == F_TCIJ)
+                       && compress_only) {
                 skip_compress.push_back(f.path);
+            } else if (ft == F_JNG) {
+                // We only get here if g_mode_explicit forced us off the
+                // default tovyCIP path (-perfile / -m / -zstd / etc.).
+                // Phase 1 JNG support is wired exclusively through the
+                // tovyCIP block above; legacy backends can't encode JNG.
+                skip_jng_legacy.push_back(f.path);
             } else if (ft == F_UNK) {
                 std::error_code ec;
                 if (!fs::exists(f.path, ec)) skip_missing.push_back(f.path);
@@ -3755,6 +4040,16 @@ int main(int argc, char** argv)
                     col(YL), col(R), skip_decompress.size());
             if (verbosity >= 1) {
                 for (auto& p : skip_decompress)
+                    fprintf(stderr, "    %s\n", p.c_str());
+            }
+        }
+        if (!skip_jng_legacy.empty()) {
+            fprintf(stderr,
+                    "%sskipped%s %zu JNG input(s): JNG requires the default tovyCIP backend\n"
+                    "         (remove -perfile / -m / -zstd / -fl2 / -kanzi / -kpng to enable)\n",
+                    col(YL), col(R), skip_jng_legacy.size());
+            if (verbosity >= 1) {
+                for (auto& p : skip_jng_legacy)
                     fprintf(stderr, "    %s\n", p.c_str());
             }
         }
