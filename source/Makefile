@@ -20,6 +20,9 @@ KANZI_DIR ?= /home/forum/git/Otros/kanzi-cpp
 LIBS_KANZI = -lz -llzma -lzstd $(KANZI_DIR)/build/libkanzi.a -lpthread
 INC_KANZI  = -I$(KANZI_DIR)/src
 
+PJG_DIR   ?= /home/forum/git/Otros/packJPG/source
+PJG_SRCS   = $(PJG_DIR)/packjpg.cpp $(PJG_DIR)/aricoder.cpp $(PJG_DIR)/bitops.cpp
+
 TARGET     = packPNG
 SRC        = packpng.cpp
 
@@ -42,7 +45,7 @@ MINGW_LIBS   = -static \
                -lstdc++ -lgcc -lgcc_eh -lws2_32
 WIN_TARGET   = packPNG.exe
 
-.PHONY: all ldf zstd fl2 kanzi clean asan win
+.PHONY: all ldf zstd fl2 kanzi kanzi-pjg clean asan win
 
 all: $(TARGET)
 
@@ -66,6 +69,14 @@ fl2: $(SRC)
 # the new TCIJ (JNG) head/image/tail sections.
 kanzi: $(SRC)
 	$(CXX) $(CXXFLAGS) -DUSE_KANZI -DUSE_ZSTD $(INC_KANZI) -o $(TARGET) $^ $(LIBS_KANZI)
+
+# kanzi + packJPG: enables TCIJ v2 (JNG Phase 2) — JDAT/JDAA routed through packJPG
+kanzi-pjg: $(SRC)
+	$(CXX) $(CXXFLAGS) -DBUILD_LIB -I$(PJG_DIR) -c $(PJG_DIR)/packjpg.cpp -o packjpg_lib.o
+	$(CXX) $(CXXFLAGS) -c $(PJG_DIR)/aricoder.cpp -o aricoder_lib.o
+	$(CXX) $(CXXFLAGS) -c $(PJG_DIR)/bitops.cpp   -o bitops_lib.o
+	$(CXX) $(CXXFLAGS) -DUSE_KANZI -DUSE_ZSTD -DUSE_PACKJPG -I$(PJG_DIR) $(INC_KANZI) \
+	    -o $(TARGET) $(SRC) packjpg_lib.o aricoder_lib.o bitops_lib.o $(LIBS_KANZI)
 
 asan: $(SRC)
 	$(CXX) $(CXXFLAGS) -fsanitize=address,undefined -g -o $(TARGET)_asan $^ $(LIBS)

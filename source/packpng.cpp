@@ -69,10 +69,10 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "c";  // letra = bugfix-only; sin letra = feature
+static const char* subversion = "";   // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
 static const int   ver_major  = 1;    // v1.8c — third bugfix on the v1.8 line. The "Press <enter> to quit" prompt added in v1.8a is now only shown when the console will actually close on our exit (Windows: detect via GetConsoleProcessList — fresh console from double-click vs inherited from cmd.exe). Running from an existing shell on either platform no longer prints the prompt — it was noise the whole time. Bug originally caused by v1.8a being too coarse; the fresh-console detection is what was needed all along. -np and -module bypass the prompt unconditionally as before, so scripted invocations are unchanged. Format unchanged from v1.8/v1.8a/v1.8b.
-static const int   ver_minor  = 8;
+static const int   ver_minor  = 9;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
 
@@ -90,6 +90,19 @@ static const uint8_t PPGS_SIG[4] = {'P','P','G','S'};
 // silently misparsing the new layout).
 static const uint8_t JNG_SIG[8]  = {0x8B,'J','N','G','\r','\n',0x1a,'\n'};
 static const uint8_t TCIJ_SIG[4] = {'T','C','I','J'};
+
+#if defined(USE_PACKJPG)
+extern "C" {
+    void pjglib_init_streams(void* in_src, int in_type, int in_size,
+                             void* out_dest, int out_type);
+    bool pjglib_convert_stream2mem(unsigned char** out_file, unsigned int* out_size,
+                                   char* msg);
+}
+// pjg_enc_mem / pjg_dec_mem defined after errormessage/MSG_SIZE below.
+static bool pjg_enc_mem(const std::vector<uint8_t>&, std::vector<uint8_t>&);
+static bool pjg_dec_mem(const std::vector<uint8_t>&, std::vector<uint8_t>&);
+#endif // USE_PACKJPG
+
 static const size_t  PROBE_BYTES    = 256u << 10;  // 256 KiB — covers most PNG IDATs in one probe
 static const int     MSG_SIZE       = 512;
 static       int     EARLYOUT_K     = 8;   // bail after K consecutive probe failures (-deep raises it)
@@ -139,6 +152,25 @@ static std::mutex g_print_mutex;
 
 static int err_tol = 1;
 thread_local char errormessage[MSG_SIZE] = "no error";
+
+#if defined(USE_PACKJPG)
+static bool pjg_enc_mem(const std::vector<uint8_t>& jpg, std::vector<uint8_t>& out) {
+    unsigned char* ptr = nullptr; unsigned int sz = 0; char msg[512] = {};
+    pjglib_init_streams((void*)jpg.data(), 1, (int)jpg.size(), nullptr, 1);
+    if (!pjglib_convert_stream2mem(&ptr, &sz, msg) || !ptr) {
+        snprintf(errormessage, MSG_SIZE, "packJPG enc: %s", msg); return false;
+    }
+    out.assign(ptr, ptr + sz); free(ptr); return true;
+}
+static bool pjg_dec_mem(const std::vector<uint8_t>& pjg, std::vector<uint8_t>& out) {
+    unsigned char* ptr = nullptr; unsigned int sz = 0; char msg[512] = {};
+    pjglib_init_streams((void*)pjg.data(), 1, (int)pjg.size(), nullptr, 1);
+    if (!pjglib_convert_stream2mem(&ptr, &sz, msg) || !ptr) {
+        snprintf(errormessage, MSG_SIZE, "packJPG dec: %s", msg); return false;
+    }
+    out.assign(ptr, ptr + sz); free(ptr); return true;
+}
+#endif // USE_PACKJPG
 
 /* ─── file list ──────────────────────────────────────────────────────────── */
 
@@ -2707,11 +2739,124 @@ static bool parse_jng_sections(
     return true;
 }
 
+#if defined(USE_PACKJPG)
+struct JngChunkEntry { uint8_t type[4]; uint32_t payload_size; };
+
+// Split the raw image-section bytes into skeleton + per-type payload streams.
+// JDAT and JDAA payloads go to their own vectors (concatenated, ready for packJPG).
+// All other chunk payloads go to other_payloads (concatenated, in order).
+static bool parse_jng_image_v2(
+    const std::vector<uint8_t>& image,
+    std::vector<JngChunkEntry>& skeleton,
+    std::vector<uint8_t>& jdat_jpeg,
+    std::vector<uint8_t>& jdaa_jpeg,
+    std::vector<uint8_t>& other_payloads)
+{
+    size_t pos = 0;
+    while (pos + 12 <= image.size()) {
+        uint32_t L    = rd_be32(image.data() + pos);
+        const uint8_t* type    = image.data() + pos + 4;
+        const uint8_t* payload = image.data() + pos + 8;
+        size_t total = 12 + (size_t)L;
+        if (pos + total > image.size()) {
+            snprintf(errormessage, MSG_SIZE, "TCIJ v2: image chunk overflows");
+            return false;
+        }
+        JngChunkEntry e; memcpy(e.type, type, 4); e.payload_size = L;
+        skeleton.push_back(e);
+        if (!memcmp(type, "JDAT", 4))
+            jdat_jpeg.insert(jdat_jpeg.end(), payload, payload + L);
+        else if (!memcmp(type, "JDAA", 4))
+            jdaa_jpeg.insert(jdaa_jpeg.end(), payload, payload + L);
+        else
+            other_payloads.insert(other_payloads.end(), payload, payload + L);
+        pos += total;
+    }
+    return true;
+}
+
+// TCIJ v2 wire format (replaces the opaque image zstd blob from v1):
+//   [header identical to v1: TCIJ_SIG + ver=2 + flags + filename]
+//   [head section: u32 raw + u32 comp + zstd bytes]
+//   [image section v2]
+//     u32  n_chunks
+//     n_chunks × (4B type + u32 payload_size)   ← skeleton
+//     u32  pjg_jdat_size  + pjg_jdat_bytes
+//     u32  pjg_jdaa_size  + pjg_jdaa_bytes
+//     u32  other_raw + u32 other_comp + zstd bytes
+//   [tail section: u32 raw + u32 comp + zstd bytes]
+static bool compress_jng_to_tcij_v2(
+    const std::string& jng_path,
+    const std::string& out_path,
+    std::vector<uint8_t>* out_bytes = nullptr)
+{
+    namespace fs = std::filesystem;
+    auto raw = read_file(jng_path);
+    if (raw.empty()) { snprintf(errormessage, MSG_SIZE, "cannot read input"); return false; }
+
+    std::vector<uint8_t> head, image, tail;
+    if (!parse_jng_sections(raw, head, image, tail)) return false;
+
+    std::vector<JngChunkEntry> skeleton;
+    std::vector<uint8_t>       jdat_jpeg, jdaa_jpeg, other_payloads;
+    if (!parse_jng_image_v2(image, skeleton, jdat_jpeg, jdaa_jpeg, other_payloads))
+        return false;
+
+    std::vector<uint8_t> pjg_jdat, pjg_jdaa;
+    if (!jdat_jpeg.empty() && !pjg_enc_mem(jdat_jpeg, pjg_jdat)) return false;
+    if (!jdaa_jpeg.empty() && !pjg_enc_mem(jdaa_jpeg, pjg_jdaa)) return false;
+
+    std::vector<uint8_t> head_c, tail_c, other_c;
+    if (!head.empty()          && !zstd_enc(head.data(), head.size(), head_c))          return false;
+    if (!tail.empty()          && !zstd_enc(tail.data(), tail.size(), tail_c))          return false;
+    if (!other_payloads.empty() && !zstd_enc(other_payloads.data(), other_payloads.size(), other_c))
+        return false;
+
+    std::string fname = fs::path(jng_path).filename().string();
+    if (fname.size() > 0xFFFFu) fname.resize(0xFFFFu);
+
+    std::vector<uint8_t> out;
+    wr_bytes(out, TCIJ_SIG, 4);
+    out.push_back(2); out.push_back(0);               // version=2, flags=0
+    uint16_t nlen = (uint16_t)fname.size();
+    out.push_back((uint8_t)(nlen & 0xFF)); out.push_back((uint8_t)(nlen >> 8));
+    out.insert(out.end(), fname.begin(), fname.end());
+
+    wr_le32(out, (uint32_t)head.size()); wr_le32(out, (uint32_t)head_c.size());
+    out.insert(out.end(), head_c.begin(), head_c.end());
+
+    wr_le32(out, (uint32_t)skeleton.size());
+    for (auto& e : skeleton) { wr_bytes(out, e.type, 4); wr_le32(out, e.payload_size); }
+    wr_le32(out, (uint32_t)pjg_jdat.size());
+    out.insert(out.end(), pjg_jdat.begin(), pjg_jdat.end());
+    wr_le32(out, (uint32_t)pjg_jdaa.size());
+    out.insert(out.end(), pjg_jdaa.begin(), pjg_jdaa.end());
+    wr_le32(out, (uint32_t)other_payloads.size()); wr_le32(out, (uint32_t)other_c.size());
+    out.insert(out.end(), other_c.begin(), other_c.end());
+
+    wr_le32(out, (uint32_t)tail.size()); wr_le32(out, (uint32_t)tail_c.size());
+    out.insert(out.end(), tail_c.begin(), tail_c.end());
+
+    if (verbosity >= 1) {
+        fprintf(stdout,
+                "  %sTCIJ v2%s %s: pjg_jdat=%zu pjg_jdaa=%zu other_c=%zu total=%zu\n",
+                col(BC), col(R), fname.c_str(),
+                pjg_jdat.size(), pjg_jdaa.size(), other_c.size(), out.size());
+    }
+    if (out_bytes) { *out_bytes = std::move(out); return true; }
+    if (dry_run) return true;
+    return write_file(out_path, out);
+}
+#endif // USE_PACKJPG
+
 static bool compress_jng_to_tcij(
     const std::string& jng_path,
     const std::string& out_path,
     std::vector<uint8_t>* out_bytes = nullptr)
 {
+#if defined(USE_PACKJPG)
+    return compress_jng_to_tcij_v2(jng_path, out_path, out_bytes);
+#endif
     namespace fs = std::filesystem;
     auto raw = read_file(jng_path);
     if (raw.empty()) {
@@ -2782,11 +2927,19 @@ static bool decompress_tcij(
     }
     size_t pos = 4;
     uint8_t ver = buf[pos++];
+#if defined(USE_PACKJPG)
+    if (ver != 1 && ver != 2) {
+        snprintf(errormessage, MSG_SIZE,
+                 "TCIJ: unsupported version %u (this build supports v1 and v2)", ver);
+        return false;
+    }
+#else
     if (ver != 1) {
         snprintf(errormessage, MSG_SIZE,
                  "TCIJ: unsupported version %u (this build supports v1)", ver);
         return false;
     }
+#endif
     uint8_t flags = buf[pos++]; (void)flags;
 
     if (pos + 2 > buf.size()) {
@@ -2833,6 +2986,101 @@ static bool decompress_tcij(
         pos += (size_t)comp;
         return true;
     };
+
+#if defined(USE_PACKJPG)
+    if (ver == 2) {
+        // v2: head (u32), image skeleton + pjg streams + other (u32), tail (u32)
+        std::vector<uint8_t> head2, tail2;
+        if (!read_section_u32(head2)) return false;
+
+        if (pos + 4 > buf.size()) {
+            snprintf(errormessage, MSG_SIZE, "TCIJ v2 truncated n_chunks"); return false;
+        }
+        uint32_t n_chunks = rd_le32(buf.data() + pos); pos += 4;
+        if (n_chunks > 100000u || pos + (size_t)n_chunks * 8 > buf.size()) {
+            snprintf(errormessage, MSG_SIZE, "TCIJ v2 bad n_chunks"); return false;
+        }
+        std::vector<JngChunkEntry> skeleton(n_chunks);
+        for (uint32_t i = 0; i < n_chunks; ++i) {
+            memcpy(skeleton[i].type, buf.data() + pos, 4); pos += 4;
+            skeleton[i].payload_size = rd_le32(buf.data() + pos); pos += 4;
+        }
+
+        auto read_raw = [&](std::vector<uint8_t>& out)->bool {
+            if (pos + 4 > buf.size()) {
+                snprintf(errormessage, MSG_SIZE, "TCIJ v2 truncated pjg size"); return false;
+            }
+            uint32_t sz = rd_le32(buf.data() + pos); pos += 4;
+            if (sz > buf.size() || pos > buf.size() - sz) {
+                snprintf(errormessage, MSG_SIZE, "TCIJ v2 truncated pjg data"); return false;
+            }
+            out.assign(buf.data() + pos, buf.data() + pos + sz); pos += sz;
+            return true;
+        };
+
+        std::vector<uint8_t> pjg_jdat_raw, pjg_jdaa_raw;
+        if (!read_raw(pjg_jdat_raw)) return false;
+        if (!read_raw(pjg_jdaa_raw)) return false;
+
+        std::vector<uint8_t> other_payloads;
+        if (!read_section_u32(other_payloads)) return false;
+        if (!read_section_u32(tail2)) return false;
+
+        // packJPG decode
+        std::vector<uint8_t> jdat_jpeg, jdaa_jpeg;
+        if (!pjg_jdat_raw.empty() && !pjg_dec_mem(pjg_jdat_raw, jdat_jpeg)) return false;
+        if (!pjg_jdaa_raw.empty() && !pjg_dec_mem(pjg_jdaa_raw, jdaa_jpeg)) return false;
+
+        // Reconstruct image chunks
+        std::vector<uint8_t> image_chunks;
+        size_t jdat_pos = 0, jdaa_pos = 0, other_pos = 0;
+        for (auto& e : skeleton) {
+            const uint8_t* payload_ptr = nullptr;
+            std::vector<uint8_t> payload_vec;
+            bool is_jdat = !memcmp(e.type, "JDAT", 4);
+            bool is_jdaa = !memcmp(e.type, "JDAA", 4);
+            if (is_jdat) {
+                if (jdat_pos + e.payload_size > jdat_jpeg.size()) {
+                    snprintf(errormessage, MSG_SIZE, "TCIJ v2 JDAT overrun"); return false;
+                }
+                payload_ptr = jdat_jpeg.data() + jdat_pos;
+                jdat_pos += e.payload_size;
+            } else if (is_jdaa) {
+                if (jdaa_pos + e.payload_size > jdaa_jpeg.size()) {
+                    snprintf(errormessage, MSG_SIZE, "TCIJ v2 JDAA overrun"); return false;
+                }
+                payload_ptr = jdaa_jpeg.data() + jdaa_pos;
+                jdaa_pos += e.payload_size;
+            } else {
+                if (other_pos + e.payload_size > other_payloads.size()) {
+                    snprintf(errormessage, MSG_SIZE, "TCIJ v2 other overrun"); return false;
+                }
+                payload_ptr = other_payloads.data() + other_pos;
+                other_pos += e.payload_size;
+            }
+            wr_be32(image_chunks, e.payload_size);
+            wr_bytes(image_chunks, e.type, 4);
+            wr_bytes(image_chunks, payload_ptr, e.payload_size);
+            wr_be32(image_chunks, chunk_crc(e.type, payload_ptr, e.payload_size));
+        }
+
+        std::vector<uint8_t> jng2;
+        wr_bytes(jng2, JNG_SIG, 8);
+        jng2.insert(jng2.end(), head2.begin(),       head2.end());
+        jng2.insert(jng2.end(), image_chunks.begin(), image_chunks.end());
+        jng2.insert(jng2.end(), tail2.begin(),        tail2.end());
+
+        if (!fname.empty()) fname = fs::path(fname).filename().string();
+        if (fname.empty()) {
+            fname = fs::path(archive_path).stem().string();
+            if (fname.empty()) fname = "out";
+            fname += ".jng";
+        }
+        fs::path odir2 = out_dir.empty() ? fs::current_path() : fs::path(out_dir);
+        std::error_code ec2; fs::create_directories(odir2, ec2);
+        return write_file((odir2 / fname).string(), jng2);
+    }
+#endif // USE_PACKJPG
 
     std::vector<uint8_t> head, image, tail;
     if (!read_section_u32(head))  return false;
