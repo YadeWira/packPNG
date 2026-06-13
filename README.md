@@ -21,36 +21,7 @@ packPNG a -r -od out/ src/ # recurse, write all outputs into out/
 > (JNG), **TCIM** (MNG). See the **[wiki](https://github.com/YadeWira/packPNG/wiki)**
 > for backends, benchmarks (incl. vs precomp) and the library API.
 
-> **v1.8:** adds JNG (JPEG Network Graphics) container support. JNG inputs are
-> parsed into 3 sections (head / image / tail), each `zstd-19` compressed, and
-> emitted as `.ppg` with internal magic `TCIJ`. Round-trip is byte-exact on the
-> sembiance JNG corpus (gray/color, IDAT/JDAA alpha, progressive). Phase 1
-> ships the wrapper format; Phase 2 will route JDAT through packJPG for a
-> ~25 % additional win on the JPEG portion.
-
-> **v1.7:** packPNG returned to a 1-input → 1-output design — multi-PNG
-> archives were removed in favour of per-file `.ppg` output. The tovyCIP
-> algorithm stayed; it just runs on each file independently now. Output
-> collisions (e.g. two `image.png` from different dirs without `-fs`) are
-> renamed `image.ppg`, `image(1).ppg`, `image(2).ppg`. Legacy multi-entry
-> `.tcip` / `.ppgs` archives from v1.4–v1.6 still decode unchanged.
-
-## Benchmarks vs xz preset 6
-
-23-PNG corpus, ~10.5 MB raw, AMD A8-6600K, 40-trial interleaved.
-
-| metric | xz `-m6` | packPNG (tovyCIP) | Δ |
-|---|---:|---:|---:|
-| **size** | 1,722,720 B | **1,720,912 B** | **−1,808 B** ✓ |
-| **encode time** | 1.43 s | **0.70 s** | **−51 %** ✓ |
-| **decode (single thread)** | 0.096 s | **0.072 s** | **−25 %** ✓ |
-| **decode (multi-thread)** median | 0.050 s | **~0.054 s** | within noise (±5 ms variance) |
-
-Single-file too: for `Cspeed.png` (~70 KB raw), the 1-entry tovyCIP `.ppg` is **23,185 B vs 25,477 B** for the per-file `.ppg` (`-perfile` mode) (`−2,292 B`, −9 %). The kanzi BWT pipeline beats LZMA-6 even on a single file — no archive-framing penalty in practice.
-
-`-kpng-max` (TPAQ) trades decode speed for max ratio: **−8,914 B** vs xz, but ~2.8× slower decode. Use only when archive size matters more than read latency.
-
-## packPNG vs precomp
+## Benchmarks — packPNG vs precomp
 
 [precomp](https://github.com/schnaader/precomp-cpp) is the reference byte-exact PNG
 recompressor (also preflate-based). It treats a PNG as a *deflate stream* and
@@ -81,19 +52,38 @@ byte-exact (17/17). Lower ratio = smaller = better.
 > competitive — it multi-threads LZMA2 internally — so packPNG's speed edge is in
 > batch. Ratio is mode-independent.
 
-## How tovyCIP works
+## How it works
 
-1. **Parse** each PNG/APNG into frames; **inflate** each IDAT stream to raw pixels.
-2. **Brute-force** zlib parameters (level, strategy, wbits, memlevel) to find the combination that reproduces the original deflate stream byte-exactly. If found → mode 0 (store raw pixels). Else → mode 1 (store the deflate stream as-is) or, with `-ldf`, mode 2 (libdeflate pixel-exact repack).
-3. **Filter-byte separation**: split the per-scanline filter byte from the pixel payload (clusters similar bytes for better BWT).
-4. **Sort entries** by pixel-buffer size descending — biggest entry first.
-5. **Split into 2 kanzi streams**: stream 0 = biggest entry alone (block 2 MB); stream 1 = rest (block 4 MB). Both encode in parallel threads. Pipeline: `RLT + BWT + SRT + ZRLT / FPAQ`.
-6. **IDAT-passthrough section**: zstd-19 with `windowLog=27` (long-range, 128 MB window).
-7. **Decode** spawns one thread per pixel stream + one for zstd_idat (all parallel). With `-th0`, automatically picks `n_workers = hw_concurrency − num_streams` to avoid thread oversubscription.
+Every backend reconstructs the **byte-identical original file** (same SHA-256);
+they differ only in how they model the image and what they cost.
 
-### Algorithms inside tovyCIP
+### TCIP — the default (preflate + WebP-lossless)
 
-| | |
+1. **Parse** each PNG/APNG into frames.
+2. **preflate** undoes each IDAT/fdAT deflate stream into the *plain* zlib data
+   plus a small stream of byte-exact *corrections* — enough to recreate the exact
+   original deflate bit-for-bit on decode (regardless of how the source was
+   encoded). This replaces the older zlib parameter brute-force and catches the
+   files that brute-force could not match.
+3. **Re-store the pixels with WebP-lossless** (method 5) — a real 2-D image codec
+   that beats a generic byte compressor on photographic and synthetic images alike.
+4. **Decode** = WebP-decode the pixels → re-apply the PNG filters → preflate
+   *recreates* the exact deflate stream → reassemble the original chunks. Decode is
+   fast (~40–90 ms/file); encode scales with pixel count (~0.3–2.3 s/file).
+
+This is what makes TCIP land **~39 % smaller than precomp** while decoding quickly.
+
+### TVCP — `-fast` (kanzi BWT + zstd)
+
+The original tovyCIP pipeline, kept for when speed matters most: inflate each IDAT
+to raw pixels, brute-force zlib params (mode 0 = store pixels / mode 1 = store the
+deflate stream / mode 2 = libdeflate repack with `-ldf`), separate the per-scanline
+filter byte, sort entries biggest-first, then encode in two parallel kanzi streams
+(`RLT + BWT + SRT + ZRLT / FPAQ`); the IDAT-passthrough goes through zstd-19 with a
+128 MB long-range window. Decode spawns one thread per stream. Much faster
+encode/decode, weaker ratio.
+
+| transform | role (TVCP / `-fast` pipeline) |
 |---|---|
 | **RLT** | Run-Length Transform — collapses runs of repeated bytes |
 | **BWT** | Burrows-Wheeler Transform — block-sort that clusters similar symbols |
@@ -102,24 +92,27 @@ byte-exact (17/17). Lower ratio = smaller = better.
 | **FPAQ** | Fast PAQ — order-0 binary arithmetic coder, bit-adaptive |
 | **zstd-19 long** | for IDAT-passthrough; high-entropy already-compressed deflate streams |
 
+Other backends: **TMCP** (`-preflate-max`, preflate + kanzi-TPAQX, archival),
+**TPCL** (`-tpcl`, preflate + multi-threaded LZMA2, precomp-style), **TCIJ** (JNG,
+packJPG on the JPEG portion), **TCIM** (MNG container). See the
+**[wiki → Backends](https://github.com/YadeWira/packPNG/wiki/Backends)**.
+
 ## Build
 
-```bash
-# Full feature build (recommended — needed for tovyCIP)
-g++ -std=c++17 -O3 -funroll-loops -fomit-frame-pointer -march=native \
-    -DUSE_KANZI -DUSE_ZSTD -DUSE_LIBDEFLATE \
-    -I<path-to-kanzi-cpp>/src \
-    -o packPNG source/packpng.cpp \
-    -lz -llzma -lzstd -ldeflate \
-    <path-to-kanzi-cpp>/build/libkanzi.a -lpthread
+Dependencies are **vendored** under `source/vendor/` (kanzi, preflate-rs, packJPG,
+mingw-deps), so the default build is just:
 
-# Minimal build — per-file LZMA only, no tovyCIP
-make
+```bash
+make            # Linux fully-static binary + Windows mingw .exe (the autonomous releases)
+make static     # Linux fully-static binary only
+make win-full   # Windows mingw .exe only
+make minimal    # LZMA-only build (no kanzi/zstd/preflate)
+make tncp       # experimental TNCP context-mixing backend (builds the TNCP Rust lib)
 ```
 
-Debian/Ubuntu deps: `apt install zlib1g-dev liblzma-dev libdeflate-dev libzstd-dev`. Plus build [kanzi-cpp](https://github.com/flanglet/kanzi-cpp) into a static lib.
-
-Windows cross-compile: `make win` (currently LZMA-only — for tovyCIP on Windows, build mingw kanzi-cpp + libzstd + libdeflate locally).
+The default binaries are **self-contained** — Linux is `ldd`-clean, Windows depends
+only on OS DLLs. The vendored `.a`'s are built locally with `-march=native` (not
+committed). Full instructions: **[wiki → Building](https://github.com/YadeWira/packPNG/wiki/Building)**.
 
 ## Library (libpackPNG)
 
@@ -210,24 +203,33 @@ by reading the file's 4-byte magic, not its name.
 | **`.ppg`** | `TCIP` | **T**ovy **C**ompresor de **I**mágenes **P**NG | **PNG/APNG DEFAULT (preflate + WebP-lossless): max ratio + fast decode** |
 | `.ppg`     | `TVCP` | **T**ovy **V**eloz **C**ompresor **P**NG | PNG/APNG `-fast` (kanzi+zstd): faster encode/decode, weaker ratio |
 | **`.ppg`** | `TMCP` | **T**ovy **M**áximo **C**ompresor **P**NG | PNG/APNG `-preflate-max` (preflate + kanzi-TPAQX): extreme ratio |
-| **`.ppg`** | `TCIJ` | **T**ovy **C**ompresor de **I**mágenes **J**NG | JNG → wrapper (v1.8+) |
-| **`.ppg`** | `TCIM` | **T**ovy **C**ompresor de **I**mágenes **M**NG | MNG → whole-file preflate container (v1.9+); store-raw fallback so output never bloats |
+| **`.ppg`** | `TPCL` | **T**ovy **P**re-**C**ompresor **L**egacy | PNG/APNG `-tpcl` (preflate + multi-threaded LZMA2): precomp-style |
+| **`.ppg`** | `TCIJ` | **T**ovy **C**ompresor de **I**mágenes **J**NG | JNG → packJPG on the JPEG portion (v2); store-raw fallback so output never bloats |
+| **`.ppg`** | `TCIM` | **T**ovy **C**ompresor de **I**mágenes **M**NG | MNG → preflate container — whole-file (Level A) or segmented-parallel (Level B); store-raw fallback |
+| `.ppg`     | `TNCP` | **T**ovy **N**eural **C**ompresor **P**NG | PNG `-tncp` (experimental context-mixing; needs `make tncp`) — falls back to TCIP |
 | `.ppg`     | `PPG1` | — | Per-file packPNG (legacy v1.0–v1.4 path; opt-in via `-perfile`) |
 | `.ppgs`    | `PPGS` | — | Legacy multi-entry archive (v1.4–v1.5pre) — still decodable |
 
 The decoder still accepts the historical per-file `.ppg` versions (v1..v15) and
-the `.ppgs` archives. **The v2 magic scheme drops pre-2.0 compatibility for the
+the `.ppgs` archives. **The v2 magic scheme dropped pre-2.0 compatibility for the
 solid backends**: `TCIP` now means the preflate+WebP default (old v1.x `.ppg`/`.tcip`
-used `TCIP` for the kanzi backend, which is now `TVCP`). Version 2.0 will freeze the
-wire format and stop breaking it. Round-trip is byte-exact for everything the
-current build produces.
+used `TCIP` for the kanzi backend, which is now `TVCP`). **Version 2.0 froze the
+wire format** — every `2.0x` release decodes any other `2.0x`'s output, and it no
+longer breaks across releases. Round-trip is byte-exact for everything the current
+build produces.
 
-### TCIJ wire format (v1.8, JNG inputs)
+### TCIJ wire format (JNG inputs)
+
+JNG inputs are split into head / image / tail. **v2** (current) routes the JPEG
+datastream (JDAT/JDAA) through **packJPG** for a large additional win on the JPEG
+portion, with a **store-raw fallback** so output never expands; the decoder also
+still reads the original **v1** wrapper below, where the image run was simply
+`zstd-19` compressed.
 
 | Offset | Size | Field |
 |---:|---:|---|
 | 0  | 4  | `TCIJ` magic |
-| 4  | 1  | version (= 1) |
+| 4  | 1  | version (= 1; v2 adds packJPG-coded JDAT/JDAA sections) |
 | 5  | 1  | flags (reserved, 0) |
 | 6  | 2  | filename_len (LE u16) |
 | 8  | N  | filename (UTF-8, original `.jng` basename) |
@@ -242,20 +244,27 @@ Reconstruction is `JNG_SIG (8 B) + head + image + tail`; original chunk
 length / type / data / CRC bytes survive untouched, so byte-exact roundtrip
 is guaranteed regardless of how the source JNG was encoded.
 
-### TCIM (v1.9, MNG inputs)
+### TCIM (MNG inputs)
 
 MNG (Multiple-image Network Graphics) is a container that embeds whole PNG,
-JNG and Delta-PNG datastreams plus zlib-compressed ancillary chunks. Level-A
-support treats the `.mng` as one opaque blob and runs it through the **preflate
-whole-file container** (the same backend as `-preflate`): every embedded
-deflate/zlib stream is undone to plain bytes + byte-exact corrections, then the
-whole thing is recompressed. The wire format is identical to `TCIP` — only the
-4-byte magic differs (`TCIM`):
+JNG and Delta-PNG datastreams plus zlib-compressed ancillary chunks. Two levels:
+
+- **Level A (ver 1)** treats the `.mng` as one opaque blob and runs it through the
+  **preflate whole-file container** (same backend as `-preflate`): every embedded
+  deflate/zlib stream is undone to plain bytes + byte-exact corrections, then the
+  whole thing is recompressed. Used for small or highly cross-frame-redundant MNGs.
+- **Level B (ver 2)** splits large MNGs (≥ 1 MB) into datastream-aligned byte
+  segments — boundaries land right after each `IEND`, so a deflate stream is never
+  cut — grouped to ≥ 512 KB, then **preflates each segment on parallel threads** and
+  recreates them in parallel on decode. Byte-exact by construction. Measured:
+  `abydos.mng` encode 35.3 s → 9.0 s (3.9×) at the same ratio.
+
+The Level-A header is identical to `TCIP` apart from the magic:
 
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 4 | `TCIM` magic |
-| 4 | 1 | version (= 1) |
+| 4 | 1 | version (1 = Level A whole-file, 2 = Level B segmented) |
 | 5 | 1 | flags — bit0: payload is stored raw (no preflate) |
 | 6 | 2 | filename_len (LE u16) |
 | 8 | N | filename (UTF-8, original `.mng` basename) |
