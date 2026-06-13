@@ -36,6 +36,10 @@ PJG_SRCS   = $(PJG_DIR)/packjpg.cpp $(PJG_DIR)/aricoder.cpp $(PJG_DIR)/bitops.cp
 PREFLATE_DIR ?= vendor/preflate-rs
 PREFLATE_LIB     = $(PREFLATE_DIR)/lib/linux/libpreflate_rs_0_7.a
 PREFLATE_LIB_WIN = $(PREFLATE_DIR)/lib/win/libpreflate_rs_0_7.a
+
+# TNCP — experimental neural/CM backend (opt-in -tncp). Rust staticlib built from ../TNCP.
+TNCP_DIR ?= ../TNCP
+TNCP_LIB  = $(TNCP_DIR)/target/release/libtncp.a
 PREFLATE_RT      = -lpthread -ldl -lm
 PREFLATE_RT_WIN  = -lws2_32 -luserenv -lbcrypt -lntdll
 PREFLATE_SRC ?= /home/forum/git/Otros/preflate-rs
@@ -75,7 +79,7 @@ MINGW_DEPS    ?= vendor/mingw-deps
 MINGW_KANZI   ?= $(KANZI_DIR)/build_win/libkanzi.a
 WIN_FULL_TARGET = packPNG-windows-x86_64-full.exe
 
-.PHONY: all minimal ldf zstd fl2 kanzi kanzi-pjg static preflate-libs clean asan win win-full
+.PHONY: all minimal ldf zstd fl2 kanzi kanzi-pjg static tncp lib lib-win preflate-libs clean asan win win-full
 
 # Default build: the self-contained / dependency-free binaries.
 #   - Linux:   fully static (no shared libs)        → packPNG
@@ -127,6 +131,43 @@ static: $(SRC)
 	$(CXX) $(CXXFLAGS) -static -DUSE_KANZI -DUSE_ZSTD -DUSE_PACKJPG -DUSE_PREFLATE -I$(PJG_DIR) $(INC_KANZI) \
 	    -o $(TARGET) $(SRC) packjpg_lib.o aricoder_lib.o bitops_lib.o \
 	    -lzstd -llzma -lz $(KANZI_DIR)/build/libkanzi.a $(PREFLATE_LIB) -lpthread $(PREFLATE_RT)
+
+# libpackPNG — static library + C API (packpng.h). Produces a self-contained fat
+# archive (packpng + packjpg + kanzi + preflate merged); consumers link only the
+# system libs shown below. Linux:
+lib: $(SRC) packpng.h
+	$(CXX) $(CXXFLAGS) -DBUILD_LIB -I$(PJG_DIR) -c $(PJG_DIR)/packjpg.cpp -o packjpg_lib.o
+	$(CXX) $(CXXFLAGS) -c $(PJG_DIR)/aricoder.cpp -o aricoder_lib.o
+	$(CXX) $(CXXFLAGS) -c $(PJG_DIR)/bitops.cpp   -o bitops_lib.o
+	$(CXX) $(CXXFLAGS) -DBUILD_LIB -DUSE_KANZI -DUSE_ZSTD -DUSE_PACKJPG -DUSE_PREFLATE \
+	    -I$(PJG_DIR) $(INC_KANZI) -c $(SRC) -o packpng_lib.o
+	rm -f libpackpng.a
+	printf 'create libpackpng.a\naddmod packpng_lib.o packjpg_lib.o aricoder_lib.o bitops_lib.o\naddlib $(KANZI_DIR)/build/libkanzi.a\naddlib $(PREFLATE_LIB)\nsave\nend\n' | ar -M
+	@echo "built libpackpng.a + packpng.h — link: <yours> libpackpng.a -lzstd -llzma -lz -lpthread -ldl -lm"
+
+# libpackPNG for Windows (mingw). Link: ... libpackpng-win.a -L vendor/mingw-deps/lib
+#   -lzstd -llzma -lz -lws2_32 -luserenv -lbcrypt -lntdll
+lib-win: $(SRC) packpng.h
+	$(MINGW_CXX) $(MINGW_FLAGS) -DBUILD_LIB -I$(PJG_DIR) -c $(PJG_DIR)/packjpg.cpp -o packjpg_win.o
+	$(MINGW_CXX) $(MINGW_FLAGS) -c $(PJG_DIR)/aricoder.cpp -o aricoder_win.o
+	$(MINGW_CXX) $(MINGW_FLAGS) -c $(PJG_DIR)/bitops.cpp   -o bitops_win.o
+	$(MINGW_CXX) $(MINGW_FLAGS) -DBUILD_LIB -DLZMA_API_STATIC -DUSE_KANZI -DUSE_ZSTD -DUSE_PACKJPG -DUSE_PREFLATE \
+	    -I$(PJG_DIR) $(INC_KANZI) -I$(MINGW_DEPS)/include -c $(SRC) -o packpng_win.o
+	rm -f libpackpng-win.a
+	printf 'create libpackpng-win.a\naddmod packpng_win.o packjpg_win.o aricoder_win.o bitops_win.o\naddlib $(MINGW_KANZI)\naddlib $(PREFLATE_LIB_WIN)\nsave\nend\n' | x86_64-w64-mingw32-ar -M
+	@echo "built libpackpng-win.a + packpng.h"
+
+# Experimental TNCP backend (opt-in -tncp). Builds the TNCP Rust staticlib first.
+# Separate target (not in `all`) — it links an extra 21 MB staticlib and the
+# backend does not beat the TCIP default; it is an experiment / archival corner.
+tncp: $(SRC)
+	cd $(TNCP_DIR) && cargo build --release
+	$(CXX) $(CXXFLAGS) -DBUILD_LIB -I$(PJG_DIR) -c $(PJG_DIR)/packjpg.cpp -o packjpg_lib.o
+	$(CXX) $(CXXFLAGS) -c $(PJG_DIR)/aricoder.cpp -o aricoder_lib.o
+	$(CXX) $(CXXFLAGS) -c $(PJG_DIR)/bitops.cpp   -o bitops_lib.o
+	$(CXX) $(CXXFLAGS) -static -DUSE_KANZI -DUSE_ZSTD -DUSE_PACKJPG -DUSE_PREFLATE -DUSE_TNCP -I$(PJG_DIR) $(INC_KANZI) \
+	    -o $(TARGET) $(SRC) packjpg_lib.o aricoder_lib.o bitops_lib.o \
+	    -lzstd -llzma -lz $(KANZI_DIR)/build/libkanzi.a $(PREFLATE_LIB) $(TNCP_LIB) -lpthread $(PREFLATE_RT)
 
 # (Re)build the preflate-rs static libs (Linux + windows-gnu) from PREFLATE_SRC,
 # then strip + copy into vendor/preflate-rs/lib/. Run once before `make`/`static`/`win-full`.

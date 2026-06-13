@@ -1,26 +1,25 @@
-# packPNG
+# packPNG — 2.0 LTS
 
-**Lossless PNG/APNG/JNG/MNG recompressor.** Each input image gets its own `.ppg`
-output via the **tovyCIP** backend (kanzi BWT + zstd-19 with `--long=27`),
-which beats `xz -m6` on size, encode time and decode time on real PNG corpora
-— while staying byte-exact reversible to the original file.
+**Lossless, byte-exact recompressor for the PNG family — PNG / APNG / JNG / MNG.**
+The default backend undoes the deflate exactly (preflate) and re-stores the image
+with **WebP-lossless**, reconstructing the **byte-identical original file** (same
+SHA-256). One self-contained, cross-platform binary; also available as a
+[library](https://github.com/YadeWira/packPNG/wiki/Library).
 
 ```bash
-packPNG a image.png        # → image.ppg     (PNG  → tovyCIP, TCIP magic)
-packPNG a animation.apng   # → animation.ppg (APNG → tovyCIP, TCIP magic)
-packPNG a image.jng        # → image.ppg     (JNG  → TCIJ wrapper)   [v1.8+]
-packPNG a clip.mng         # → clip.ppg      (MNG  → TCIM container)  [v1.9+]
-packPNG x image.ppg        # extract back to the original byte-exact file
+packPNG a image.png        # → image.ppg     (PNG/APNG → TCIP, preflate + WebP-lossless)
+packPNG a image.jng        # → image.ppg     (JNG  → TCIJ, packJPG)
+packPNG a clip.mng         # → clip.ppg      (MNG  → TCIM container)
+packPNG x image.ppg        # restore the exact original file (byte-identical)
 packPNG a -r -od out/ src/ # recurse, write all outputs into out/
 ```
 
-> **Magic naming (v2 scheme):** every magic spells out its backend.
-> **TCIP** = *Tovy Compresor de Imágenes PNG* (default: preflate + WebP-lossless),
-> **TVCP** = *Tovy Veloz Compresor PNG* (`-fast`: kanzi + zstd),
-> **TMCP** = *Tovy Máximo Compresor PNG* (`-preflate-max`: kanzi-TPAQX),
-> **TCIJ** = *Tovy Compresor de Imágenes JNG*, **TCIM** = *Tovy Compresor de Imágenes MNG*.
-> These magics drop pre-2.0 backward compatibility (old `.ppg`/`.tcip` from v1.x
-> used `TCIP` for the kanzi backend); 2.0 will freeze the format and stop breaking it.
+> **2.0 LTS — the wire format is frozen.** From 2.0 onward every `2.0x` release
+> decodes any other `2.0x`'s output. Magics spell out the backend: **TCIP**
+> (default, preflate + WebP-lossless), **TVCP** (`-fast`, kanzi + zstd), **TMCP**
+> (`-preflate-max`, kanzi-TPAQX), **TPCL** (`-tpcl`, preflate + LZMA2), **TCIJ**
+> (JNG), **TCIM** (MNG). See the **[wiki](https://github.com/YadeWira/packPNG/wiki)**
+> for backends, benchmarks (incl. vs precomp) and the library API.
 
 > **v1.8:** adds JNG (JPEG Network Graphics) container support. JNG inputs are
 > parsed into 3 sections (head / image / tail), each `zstd-19` compressed, and
@@ -50,6 +49,37 @@ packPNG a -r -od out/ src/ # recurse, write all outputs into out/
 Single-file too: for `Cspeed.png` (~70 KB raw), the 1-entry tovyCIP `.ppg` is **23,185 B vs 25,477 B** for the per-file `.ppg` (`-perfile` mode) (`−2,292 B`, −9 %). The kanzi BWT pipeline beats LZMA-6 even on a single file — no archive-framing penalty in practice.
 
 `-kpng-max` (TPAQ) trades decode speed for max ratio: **−8,914 B** vs xz, but ~2.8× slower decode. Use only when archive size matters more than read latency.
+
+## packPNG vs precomp
+
+[precomp](https://github.com/schnaader/precomp-cpp) is the reference byte-exact PNG
+recompressor (also preflate-based). It treats a PNG as a *deflate stream* and
+re-compresses it with LZMA2; packPNG un-filters to *pixels* and uses a real image
+codec. Both reproduce the original file **byte-for-byte** — same job, different ratio.
+
+17 real-world PNGs (1.52 MB total), 56-core Xeon E5-2690 v4. Every row verified
+byte-exact (17/17). Lower ratio = smaller = better.
+
+| backend | what it does | ratio | encode | decode |
+|---|---|---:|---:|---:|
+| **TCIP** (default) | preflate + WebP-lossless | **45.7 %** | 2.38 s | 0.72 s |
+| **TMCP** (`-preflate-max`) | preflate + kanzi-TPAQX (archival) | 47.6 % | 11.8 s | 11.5 s |
+| **TPCL** (`-tpcl`) | preflate + multi-threaded LZMA2 | 64.3 % | 1.68 s | 0.58 s |
+| **TVCP** (`-fast`) | kanzi BWT + zstd | 85.6 % | 0.39 s | 0.04 s |
+| precomp 0.4.8 | preflate + LZMA2 | 75.3 % | 2.21 s | 0.98 s |
+
+- **TCIP** (the default) is **39 % smaller** than precomp — modelling the image with
+  WebP-lossless beats LZMA2-on-deflated-bytes.
+- **TPCL** uses precomp's *exact* recipe (preflate + LZMA2) yet wins on **all three
+  axes** — smaller (64 vs 75 %) and faster — thanks to a newer preflate + LZMA2.
+- **TVCP** trades ratio for raw speed (~6× faster decode than precomp).
+- precomp's `-intense` / `-brute` don't change PNG results (the IDAT is already found
+  by default; those modes only help raw/embedded zlib in other container types).
+
+> Speed methodology: packPNG times are `-th0` (parallel across files); precomp is
+> per-file (it has no batch mode). For a *single* file precomp's encode/decode is
+> competitive — it multi-threads LZMA2 internally — so packPNG's speed edge is in
+> batch. Ratio is mode-independent.
 
 ## How tovyCIP works
 

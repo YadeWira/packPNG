@@ -18,5 +18,11 @@ source/vendor/kanzi-cpp/build_win/
 source/packPNG-linux-*
 source/packPNG-windows-*
 
+# libpackPNG static libraries — fat archives built by `make lib` / `make lib-win`
+# (-march=native on Linux); regenerate locally. The public header packpng.h IS tracked.
+source/libpackpng.a
+source/libpackpng-win.a
+source/TNCP/target/
+
 # Local connection notes / credentials (VM SSH). MUST never be committed.
 CONEXION-IA.md
