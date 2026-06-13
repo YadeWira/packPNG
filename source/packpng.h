@@ -32,6 +32,27 @@ int packpng_compress_file(const char* in_path, const char* out_path, packpng_bac
  * Returns 0 on success, nonzero on error. */
 int packpng_decompress_file(const char* in_path, const char* out_dir);
 
+/* ── In-memory API (for archivers / embedding) ──
+ * Multithreading is ON by default. On success returns 0 and sets `*out` to a
+ * heap buffer of `*out_len` bytes — free it with packpng_free(). On error
+ * returns nonzero (see packpng_last_error) and leaves *out NULL. */
+
+/* Compress a PNG/APNG/JNG/MNG image held in memory (`in`,`in_len`) to a .ppg in
+ * memory. `name_hint` is the original filename stored in the container (may be
+ * NULL). The image type is detected from `in`'s bytes, not the name. */
+int packpng_compress_mem(const unsigned char* in, size_t in_len, const char* name_hint,
+                         unsigned char** out, size_t* out_len, packpng_backend backend);
+
+/* Decompress a .ppg held in memory (`in`,`in_len`) back to the original bytes. */
+int packpng_decompress_mem(const unsigned char* in, size_t in_len,
+                           unsigned char** out, size_t* out_len);
+
+/* Free a buffer returned by packpng_compress_mem / packpng_decompress_mem. */
+void packpng_free(unsigned char* p);
+
+/* Override the worker-thread count for subsequent calls (0 = auto = default). */
+void packpng_set_threads(int n);
+
 /* Last error message (thread-local). Valid until the next API call. */
 const char* packpng_last_error(void);
 

@@ -69,7 +69,7 @@
 
 /* ─── version ────────────────────────────────────────────────────────────── */
 
-static const char* subversion = "";   // letra = bugfix-only; sin letra = feature
+static const char* subversion = "a";  // 2.0a — libpackPNG in-memory API + MT-by-default (format unchanged)
 static const char* author     = "Yade Bravo (YadeWira)";
 // 2.0 LTS — first long-term-support release. The wire format (magics
 // TCIP/TVCP/TMCP/TCIJ/TCIM/TNCP/TPCL and their layouts) is now FROZEN: every
@@ -4828,12 +4828,38 @@ static void show_help() {
 /* ─── libpackPNG public C API (BUILD_LIB) ─────────────────────────────────── */
 #ifdef BUILD_LIB
 #include "packpng.h"
+
+static int g_lib_threads = 0;  // 0 = auto (multithreading ON by default)
+
+// Library global setup: quiet, overwrite, and multithreading on by default
+// (across-file / kanzi jobs / MT-LZMA where each backend supports it).
+static void lib_setup() {
+    verbosity = 0; dry_run = false; overwrite = true;
+    int hw = (int)std::thread::hardware_concurrency(); if (hw < 1) hw = 4;
+    num_threads = (g_lib_threads > 0) ? g_lib_threads : hw;
+    g_threads_auto = (g_lib_threads == 0);
+    g_solid_jobs = num_threads;
+    g_solid_dec_jobs = num_threads;
+}
+
+// Unique temp dir for the in-memory wrappers (steady_clock + atomic counter).
+static std::string lib_tmpdir() {
+    namespace fs = std::filesystem;
+    static std::atomic<unsigned long long> ctr{0};
+    unsigned long long t = (unsigned long long)std::chrono::steady_clock::now().time_since_epoch().count();
+    std::string d = (fs::temp_directory_path() /
+                     ("packpng_" + std::to_string(t) + "_" + std::to_string(ctr.fetch_add(1)))).string();
+    std::error_code ec; fs::create_directories(d, ec);
+    return d;
+}
+
 extern "C" {
+
+void packpng_set_threads(int n) { g_lib_threads = (n > 0) ? n : 0; }
 
 int packpng_compress_file(const char* in_path, const char* out_path, packpng_backend backend) {
     if (!in_path || !out_path) { snprintf(errormessage, MSG_SIZE, "null argument"); return 1; }
-    verbosity = 0; dry_run = false; overwrite = true;            // library defaults
-    if (num_threads < 1) num_threads = 1;
+    lib_setup();
     std::string in = in_path, out = out_path;
     FileType ft = detect_type(in);
     bool ok = false;
@@ -4877,8 +4903,7 @@ int packpng_compress_file(const char* in_path, const char* out_path, packpng_bac
 
 int packpng_decompress_file(const char* in_path, const char* out_dir) {
     if (!in_path || !out_dir) { snprintf(errormessage, MSG_SIZE, "null argument"); return 1; }
-    verbosity = 0; dry_run = false; overwrite = true;
-    if (num_threads < 1) num_threads = 1;
+    lib_setup();
     std::string in = in_path, od = out_dir;
     FileType ft = detect_type(in);
     bool ok = false;
@@ -4906,9 +4931,64 @@ const char* packpng_last_error(void) { return errormessage; }
 
 const char* packpng_version(void) {
     static char v[32];
-    snprintf(v, sizeof v, "%d.%d", ver_major, ver_minor);
+    snprintf(v, sizeof v, "%d.%d%s", ver_major, ver_minor, subversion);
     return v;
 }
+
+// ── In-memory API (archiver / embedding) — buffer in, buffer out ──
+int packpng_compress_mem(const unsigned char* in, size_t in_len, const char* name_hint,
+                         unsigned char** out, size_t* out_len, packpng_backend backend) {
+    namespace fs = std::filesystem;
+    if (!in || !out || !out_len) { snprintf(errormessage, MSG_SIZE, "null argument"); return 1; }
+    *out = nullptr;
+    std::string dir = lib_tmpdir();
+    std::string base = (name_hint && *name_hint) ? fs::path(name_hint).filename().string() : std::string("image.png");
+    if (base.empty()) base = "image.png";
+    std::string inp = (fs::path(dir) / base).string();
+    std::string outp = (fs::path(dir) / "packpng_out.ppg").string();
+    write_file(inp, std::vector<uint8_t>(in, in + in_len));
+    int rc = packpng_compress_file(inp.c_str(), outp.c_str(), backend);
+    if (rc == 0) {
+        auto v = read_file(outp);
+        if (v.empty()) { snprintf(errormessage, MSG_SIZE, "mem compress: empty output"); rc = 1; }
+        else {
+            unsigned char* p = (unsigned char*)malloc(v.size());
+            if (!p) { snprintf(errormessage, MSG_SIZE, "oom"); rc = 1; }
+            else { memcpy(p, v.data(), v.size()); *out = p; *out_len = v.size(); }
+        }
+    }
+    std::error_code ec; fs::remove_all(dir, ec);
+    return rc;
+}
+
+int packpng_decompress_mem(const unsigned char* in, size_t in_len,
+                           unsigned char** out, size_t* out_len) {
+    namespace fs = std::filesystem;
+    if (!in || !out || !out_len) { snprintf(errormessage, MSG_SIZE, "null argument"); return 1; }
+    *out = nullptr;
+    std::string dir = lib_tmpdir();
+    std::string ppg = (fs::path(dir) / "in.ppg").string();
+    std::string odir = (fs::path(dir) / "o").string();
+    write_file(ppg, std::vector<uint8_t>(in, in + in_len));
+    int rc = packpng_decompress_file(ppg.c_str(), odir.c_str());
+    if (rc == 0) {
+        std::error_code ec; std::string found;
+        for (auto& e : fs::recursive_directory_iterator(odir, ec)) {
+            if (e.is_regular_file(ec)) { found = e.path().string(); break; }
+        }
+        if (found.empty()) { snprintf(errormessage, MSG_SIZE, "mem decompress: no output"); rc = 1; }
+        else {
+            auto v = read_file(found);
+            unsigned char* p = (unsigned char*)malloc(v.size() ? v.size() : 1);
+            if (!p) { snprintf(errormessage, MSG_SIZE, "oom"); rc = 1; }
+            else { memcpy(p, v.data(), v.size()); *out = p; *out_len = v.size(); }
+        }
+    }
+    std::error_code ec; fs::remove_all(dir, ec);
+    return rc;
+}
+
+void packpng_free(unsigned char* p) { free(p); }
 
 } // extern "C"
 #endif // BUILD_LIB

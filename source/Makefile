@@ -132,22 +132,24 @@ static: $(SRC)
 	    -o $(TARGET) $(SRC) packjpg_lib.o aricoder_lib.o bitops_lib.o \
 	    -lzstd -llzma -lz $(KANZI_DIR)/build/libkanzi.a $(PREFLATE_LIB) -lpthread $(PREFLATE_RT)
 
-# libpackPNG — static library + C API (packpng.h). Produces a self-contained fat
-# archive (packpng + packjpg + kanzi + preflate merged); consumers link only the
-# system libs shown below. Linux:
+# libpackPNG — static + shared library + C API (packpng.h). Self-contained fat
+# archives (packpng + packjpg + kanzi + preflate merged); consumers link only the
+# system libs. Objects are -fPIC so they serve both the .a and the .so. Linux:
 lib: $(SRC) packpng.h
-	$(CXX) $(CXXFLAGS) -DBUILD_LIB -I$(PJG_DIR) -c $(PJG_DIR)/packjpg.cpp -o packjpg_lib.o
-	$(CXX) $(CXXFLAGS) -c $(PJG_DIR)/aricoder.cpp -o aricoder_lib.o
-	$(CXX) $(CXXFLAGS) -c $(PJG_DIR)/bitops.cpp   -o bitops_lib.o
-	$(CXX) $(CXXFLAGS) -DBUILD_LIB -DUSE_KANZI -DUSE_ZSTD -DUSE_PACKJPG -DUSE_PREFLATE \
+	$(CXX) $(CXXFLAGS) -fPIC -DBUILD_LIB -I$(PJG_DIR) -c $(PJG_DIR)/packjpg.cpp -o packjpg_lib.o
+	$(CXX) $(CXXFLAGS) -fPIC -c $(PJG_DIR)/aricoder.cpp -o aricoder_lib.o
+	$(CXX) $(CXXFLAGS) -fPIC -c $(PJG_DIR)/bitops.cpp   -o bitops_lib.o
+	$(CXX) $(CXXFLAGS) -fPIC -DBUILD_LIB -DUSE_KANZI -DUSE_ZSTD -DUSE_PACKJPG -DUSE_PREFLATE \
 	    -I$(PJG_DIR) $(INC_KANZI) -c $(SRC) -o packpng_lib.o
 	rm -f libpackpng.a
 	printf 'create libpackpng.a\naddmod packpng_lib.o packjpg_lib.o aricoder_lib.o bitops_lib.o\naddlib $(KANZI_DIR)/build/libkanzi.a\naddlib $(PREFLATE_LIB)\nsave\nend\n' | ar -M
-	@echo "built libpackpng.a + packpng.h — link: <yours> libpackpng.a -lzstd -llzma -lz -lpthread -ldl -lm"
+	$(CXX) -shared -o libpackpng.so packpng_lib.o packjpg_lib.o aricoder_lib.o bitops_lib.o \
+	    $(KANZI_DIR)/build/libkanzi.a $(PREFLATE_LIB) -lzstd -llzma -lz -lpthread -ldl -lm
+	-strip libpackpng.so
+	@echo "built libpackpng.a + libpackpng.so + packpng.h"
 
-# libpackPNG for Windows (mingw). Link: ... libpackpng-win.a -L vendor/mingw-deps/lib
-#   -lzstd -llzma -lz -lws2_32 -luserenv -lbcrypt -lntdll
-lib-win: $(SRC) packpng.h
+# libpackPNG for Windows (mingw): static .a + DLL (+ import lib via packpng.def).
+lib-win: $(SRC) packpng.h packpng.def
 	$(MINGW_CXX) $(MINGW_FLAGS) -DBUILD_LIB -I$(PJG_DIR) -c $(PJG_DIR)/packjpg.cpp -o packjpg_win.o
 	$(MINGW_CXX) $(MINGW_FLAGS) -c $(PJG_DIR)/aricoder.cpp -o aricoder_win.o
 	$(MINGW_CXX) $(MINGW_FLAGS) -c $(PJG_DIR)/bitops.cpp   -o bitops_win.o
@@ -155,7 +157,12 @@ lib-win: $(SRC) packpng.h
 	    -I$(PJG_DIR) $(INC_KANZI) -I$(MINGW_DEPS)/include -c $(SRC) -o packpng_win.o
 	rm -f libpackpng-win.a
 	printf 'create libpackpng-win.a\naddmod packpng_win.o packjpg_win.o aricoder_win.o bitops_win.o\naddlib $(MINGW_KANZI)\naddlib $(PREFLATE_LIB_WIN)\nsave\nend\n' | x86_64-w64-mingw32-ar -M
-	@echo "built libpackpng-win.a + packpng.h"
+	$(MINGW_CXX) -shared -static -static-libgcc -static-libstdc++ -o packpng.dll \
+	    packpng_win.o packjpg_win.o aricoder_win.o bitops_win.o \
+	    $(MINGW_KANZI) $(PREFLATE_LIB_WIN) -L$(MINGW_DEPS)/lib -lzstd -llzma -lz \
+	    -lws2_32 -luserenv -lbcrypt -lntdll -Wl,--out-implib,libpackpng.dll.a packpng.def
+	-x86_64-w64-mingw32-strip packpng.dll
+	@echo "built libpackpng-win.a + packpng.dll + libpackpng.dll.a + packpng.h"
 
 # Experimental TNCP backend (opt-in -tncp). Builds the TNCP Rust staticlib first.
 # Separate target (not in `all`) — it links an extra 21 MB staticlib and the

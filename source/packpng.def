@@ -1,0 +1,9 @@
+EXPORTS
+packpng_compress_file
+packpng_decompress_file
+packpng_compress_mem
+packpng_decompress_mem
+packpng_free
+packpng_set_threads
+packpng_last_error
+packpng_version
