@@ -1,0 +1,15 @@
+[package]
+name = "tncp"
+version = "0.1.0"
+edition = "2021"
+description = "Tovy Neural Compresor PNG — lossless neural entropy coder (byte-exact)"
+license = "MIT"
+
+[lib]
+# staticlib → links into packPNG (like preflate-rs); rlib → cargo test / reuse.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

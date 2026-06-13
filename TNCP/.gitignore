@@ -1,0 +1,5 @@
+/target
+Cargo.lock
+*.tncp
+# trained model weights (large; versioned/distributed separately)
+/weights/*.bin
