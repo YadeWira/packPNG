@@ -121,6 +121,34 @@ Debian/Ubuntu deps: `apt install zlib1g-dev liblzma-dev libdeflate-dev libzstd-d
 
 Windows cross-compile: `make win` (currently LZMA-only — for tovyCIP on Windows, build mingw kanzi-cpp + libzstd + libdeflate locally).
 
+## Library (libpackPNG)
+
+packPNG is also a **library** — static (`.a`) and shared (`.so` / `.dll`) — with a
+small C API (`source/packpng.h`) so archivers and asset pipelines can embed the
+codec. **Multithreading is on by default.**
+
+```bash
+make lib       # Linux:   libpackpng.a + libpackpng.so + packpng.h
+make lib-win   # Windows: libpackpng-win.a + packpng.dll + libpackpng.dll.a + packpng.def
+```
+
+```c
+#include "packpng.h"
+
+/* File → file */
+packpng_compress_file("image.png", "image.ppg", PACKPNG_TCIP);
+packpng_decompress_file("image.ppg", "out/");   /* → out/image.png, byte-exact */
+
+/* In-memory (buffer → buffer) — for embedding */
+unsigned char* out; size_t out_len;
+packpng_compress_mem(png, png_len, "image.png", &out, &out_len, PACKPNG_TCIP);
+/* ... use out/out_len ... */  packpng_free(out);
+```
+
+Prebuilt SDK bundles (static + shared + header) are attached to every
+[release](https://github.com/YadeWira/packPNG/releases). Full API and link lines:
+**[wiki → Library](https://github.com/YadeWira/packPNG/wiki/Library)**.
+
 ## Usage
 
 ```
