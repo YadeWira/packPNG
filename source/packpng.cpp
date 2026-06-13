@@ -78,18 +78,34 @@ static const int   ver_minor  = 9;
 
 static const uint8_t PNG_SIG[8] = {0x89,'P','N','G','\r','\n',0x1a,'\n'};
 static const uint8_t PPG_SIG[4] = {'P','P','G','1'};
-// tovyCIP — Tovy Compresor de Imágenes PNG. Multi-stream PNG archive.
-// STRICT 4-axis WIN over xz preset 6 (size, comp, decST, dec-th0).
+// TCIP — Tovy Compresor de Imágenes PNG. The DEFAULT PNG/APNG backend (v2 magic
+// scheme): the whole file is wrapped in a preflate "container" (deflate undone to
+// raw + corrections, PNG row filters reversed, then WebP-lossless) that recreates
+// the source byte-exact. Best ratio + fast decode.
+// NOTE (v2 rename): magics no longer carry pre-2.0 backward compat — TCIP used to
+// mean the old kanzi+zstd backend (now TVCP); see the rename table in the README.
 static const uint8_t TCIP_SIG[4] = {'T','C','I','P'};
+// TVCP — Tovy Veloz Compresor PNG. The OLD fast backend (-fast): kanzi
+// RLT+BWT+SRT+ZRLT/FPAQ pixels + zstd-19 idat. Faster encode/decode, weaker ratio.
+static const uint8_t TVCP_SIG[4] = {'T','V','C','P'};
 // Legacy magic — decoder still accepts PPGS archives from v1.4-v1.5pre.
 static const uint8_t PPGS_SIG[4] = {'P','P','G','S'};
 // JNG (JPEG Network Graphics) container support — v1.8.
 // JNG_SIG mirrors PNG_SIG but with high-bit 'J': identifies a JNG input file.
-// TCIJ_SIG is the magic for JNG-derived .ppg outputs (v1.7 TCIP for PNG; TCIJ
-// for JNG so legacy decoders fail cleanly with "bad TCIP magic" instead of
-// silently misparsing the new layout).
+// TCIJ_SIG — Tovy Compresor de Imágenes JNG — is the magic for JNG-derived .ppg
+// outputs (so decoders pick the JNG path instead of misparsing the layout).
 static const uint8_t JNG_SIG[8]  = {0x8B,'J','N','G','\r','\n',0x1a,'\n'};
 static const uint8_t TCIJ_SIG[4] = {'T','C','I','J'};
+// TMCP — Tovy Máximo Compresor PNG: opt-in (-preflate-max) extreme-ratio output.
+// Like TCIP but the inflated pixels are compressed with kanzi TPAQX (instead of
+// the container's WebP/zstd) and only the small preflate corrections are stored.
+// Best byte-exact ratio measured; very slow encode+decode. Own magic.
+static const uint8_t TMCP_SIG[4] = {'T','M','C','P'};
+// MNG (Multiple-image Network Graphics) — a container that embeds PNG/JNG
+// datastreams. Recompressed whole-file via the preflate container (it finds all
+// embedded IDAT deflate streams) → magic TCIM (Tovy Compresor de Imágenes MNG).
+static const uint8_t MNG_SIG[8]  = {0x8A,'M','N','G','\r','\n',0x1a,'\n'};
+static const uint8_t TCIM_SIG[4] = {'T','C','I','M'};
 
 #if defined(USE_PACKJPG)
 extern "C" {
@@ -133,6 +149,8 @@ static bool use_solid       = false;  // -solid: PPGS archive (single kanzi cont
 static bool use_kpng_max    = false;  // -kpng-max: max-ratio TPAQ pipeline (RLT/TPAQ, blk=2M, jobs=8)
 static bool use_perfile     = false;  // -perfile: opt out of solid auto-default (force traditional .ppg per file)
 static bool g_mode_explicit = false;  // user passed an explicit mode flag (-solid/-kpng/-zstd/-fl2/-kanzi/-perfile)
+static bool g_preflate      = false;  // -preflate: opt-in max-ratio mode (preflate container on each IDAT)
+static bool g_preflate_max  = false;  // -preflate-max: extreme ratio (preflate corrections + kanzi-TPAQX pixels, TMCP)
 [[maybe_unused]]
 static int  g_kanzi_level   = 7;      // kanzi level 7 (LZP+TEXT+UTF+BWT+LZP / CM): generic Pareto-optimal vs xz-m6
 static int  verbosity       = 0;
@@ -144,6 +162,16 @@ static bool g_threads_auto  = false;  // true if user passed -th0 (auto pick)
 // Set via -fastdec flag (= 4MB), -nofsep=N, or PACKPNG_NO_FSEP_ABOVE env var.
 static size_t g_nofsep_above = 0;
 static int  sfth_threads    = 1;
+// Per-file kanzi internal job count for the tovyCIP encoder. 0 = legacy fixed
+// default (4). Set adaptively in main() to max(1, hw / file_pool) so a single
+// file uses all cores while a large batch avoids pool×jobs oversubscription.
+// Output bytes are independent of job count (kanzi only parallelizes blocks),
+// so this is a pure speed knob with zero ratio impact. Env PACKPNG_SOLID_J wins.
+static int  g_solid_jobs    = 0;
+// Same idea for decode: per-stream kanzi decode jobs, set adaptively in main()
+// to max(1, hw / decode_pool). 0 = legacy fixed default. Decode is deterministic
+// regardless of job count, so this is also a pure speed knob.
+static int  g_solid_dec_jobs = 0;
 static unsigned g_lzma_preset = 6u;
 static std::string outdir;
 static bool fs_mode = false;  // -fs: preserve source folder structure under -od when -r expands a dir
@@ -1088,6 +1116,70 @@ static bool kanzi_dec(const uint8_t*, size_t, std::vector<uint8_t>&, size_t) {
 }
 #endif
 
+/* ─── preflate (mode 3): byte-exact deflate recompression via Rust staticlib ─
+ * preflate undoes any deflate stream into (plain + reconstruction corrections)
+ * and recreates the byte-exact original. We feed it each frame's whole IDAT
+ * zlib stream and store the resulting "container" blob (preflate + internal
+ * zstd). Decode recreates the exact zlib stream. Opt-in (-preflate): big ratio
+ * win on real PNGs whose deflate the zlib brute-force can't reproduce, at the
+ * cost of slower encode. FFI lives in source/vendor/preflate-rs (ffi_oneshot.rs).
+ */
+#ifdef USE_PREFLATE
+extern "C" {
+int32_t pf_container_compress(const uint8_t* in, size_t in_len, uint32_t max_chain,
+                              int32_t zstd_level, uint8_t** out, size_t* out_len);
+int32_t pf_container_recreate(const uint8_t* in, size_t in_len,
+                              uint8_t** out, size_t* out_len);
+int32_t pf_deflate_split(const uint8_t* in, size_t in_len, uint32_t max_chain,
+                         uint8_t** plain, size_t* plain_len,
+                         uint8_t** corr, size_t* corr_len);
+int32_t pf_deflate_recreate(const uint8_t* plain, size_t plain_len,
+                            const uint8_t* corr, size_t corr_len,
+                            uint8_t** out, size_t* out_len);
+void    pf_free(uint8_t* p, size_t len);
+}
+// Low-level split: deflate → (plain, corrections). plain should equal the
+// inflated IDAT; we keep only the corrections (the pixels go through kanzi).
+static bool preflate_split(const std::vector<uint8_t>& deflate,
+                           std::vector<uint8_t>& plain, std::vector<uint8_t>& corr) {
+    if (deflate.empty()) return false;
+    uint8_t *p = nullptr, *c = nullptr; size_t pn = 0, cn = 0;
+    if (pf_deflate_split(deflate.data(), deflate.size(), 4096, &p, &pn, &c, &cn) != 0) return false;
+    plain.assign(p, p + pn); corr.assign(c, c + cn);
+    pf_free(p, pn); pf_free(c, cn);
+    return true;
+}
+static bool preflate_deflate_recreate(const std::vector<uint8_t>& plain,
+                                      const uint8_t* corr, size_t corr_len,
+                                      std::vector<uint8_t>& out) {
+    uint8_t* p = nullptr; size_t n = 0;
+    if (pf_deflate_recreate(plain.data(), plain.size(), corr, corr_len, &p, &n) != 0 || !p) return false;
+    out.assign(p, p + n); pf_free(p, n);
+    return true;
+}
+static bool preflate_compress(const std::vector<uint8_t>& in, std::vector<uint8_t>& out) {
+    if (in.empty()) return false;
+    // zstd level 19 (decode speed is level-independent → free ratio vs the
+    // library default of 9). Overridable via PACKPNG_PREFLATE_ZL.
+    int zl = 19;
+    if (const char* z = getenv("PACKPNG_PREFLATE_ZL")) { int v = atoi(z); if (v >= 1 && v <= 22) zl = v; }
+    uint8_t* p = nullptr; size_t n = 0;
+    if (pf_container_compress(in.data(), in.size(), 4096, zl, &p, &n) != 0 || !p) return false;
+    out.assign(p, p + n);
+    pf_free(p, n);
+    return true;
+}
+static bool preflate_recreate(const uint8_t* in, size_t in_len, std::vector<uint8_t>& out) {
+    static const size_t MAX_RAW = 1ull << 32;  // 4 GB cap vs corrupt container
+    uint8_t* p = nullptr; size_t n = 0;
+    if (pf_container_recreate(in, in_len, &p, &n) != 0 || !p) return false;
+    if (n > MAX_RAW) { pf_free(p, n); return false; }
+    out.assign(p, p + n);
+    pf_free(p, n);
+    return true;
+}
+#endif // USE_PREFLATE
+
 /* ─── compress PNG/APNG → PPG v4 (solid LZMA + filter separation) ───────── */
 
 struct FrameEnc {
@@ -1904,7 +1996,7 @@ static bool write_file(const std::string& path, const std::vector<uint8_t>& data
     return true;
 }
 
-enum FileType { F_PNG, F_PPG, F_TCIP, F_JNG, F_TCIJ, F_UNK };
+enum FileType { F_PNG, F_PPG, F_TVCP, F_JNG, F_TCIJ, F_TCIP, F_TMCP, F_MNG, F_TCIM, F_UNK };
 
 static FileType detect_type(const std::string& path) {
     FILE* f = fopen(path.c_str(), "rb");
@@ -1912,9 +2004,13 @@ static FileType detect_type(const std::string& path) {
     uint8_t buf[8]; size_t n = fread(buf, 1, 8, f); fclose(f);
     if (n >= 8 && memcmp(buf, PNG_SIG, 8) == 0) return F_PNG;
     if (n >= 8 && memcmp(buf, JNG_SIG, 8) == 0) return F_JNG;
-    if (n >= 4 && memcmp(buf, TCIP_SIG, 4) == 0) return F_TCIP;
+    if (n >= 8 && memcmp(buf, MNG_SIG, 8) == 0) return F_MNG;
+    if (n >= 4 && memcmp(buf, TVCP_SIG, 4) == 0) return F_TVCP;
     if (n >= 4 && memcmp(buf, TCIJ_SIG, 4) == 0) return F_TCIJ;
-    if (n >= 4 && memcmp(buf, PPGS_SIG, 4) == 0) return F_TCIP;  // legacy
+    if (n >= 4 && memcmp(buf, TCIP_SIG, 4) == 0) return F_TCIP;
+    if (n >= 4 && memcmp(buf, TMCP_SIG, 4) == 0) return F_TMCP;
+    if (n >= 4 && memcmp(buf, TCIM_SIG, 4) == 0) return F_TCIM;
+    if (n >= 4 && memcmp(buf, PPGS_SIG, 4) == 0) return F_TVCP;  // legacy
     if (n >= 4 && memcmp(buf, PPG_SIG, 4) == 0) return F_PPG;
     return F_UNK;
 }
@@ -2051,7 +2147,7 @@ static inline void tick_bar() {
 // per-file overhead. kanzi jobs=4 internal = full 4-core saturation on decode.
 // Result: strict 4-axis win vs xz preset 6 (size, comp, decST, dec-th0).
 
-// (TCIP_SIG / PPGS_SIG declared above near PPG_SIG to allow detect_type to use them)
+// (TVCP_SIG / PPGS_SIG declared above near PPG_SIG to allow detect_type to use them)
 
 struct SolidEntry {
     std::string name;
@@ -2543,8 +2639,13 @@ static bool compress_tovycip_archive(
             const char* j_env = getenv("PACKPNG_SOLID_J");
             std::string t, e;
             int bs, jb;
+            // Adaptive default job count (overridable below by PACKPNG_SOLID_J):
+            // main() sets g_solid_jobs = max(1, hw / file_pool). Falls back to the
+            // historical fixed values when unset (single-call / legacy paths).
+            int auto_jb = (g_solid_jobs > 0) ? g_solid_jobs : 4;
             if (use_kpng_max) {
-                t = "RLT"; e = "TPAQ"; bs = 2 * 1024 * 1024; jb = 8;
+                t = "RLT"; e = "TPAQ"; bs = 2 * 1024 * 1024;
+                jb = (g_solid_jobs > 0) ? g_solid_jobs : 8;
             } else {
                 // Multi-stream Pareto: stream 0 holds the biggest entry (likely
                 // 4MB+) — give it smaller blocks (1MB) so kanzi's internal
@@ -2560,7 +2661,7 @@ static bool compress_tovycip_archive(
                     (NUM_STREAMS == 3 && s == 1);
                 bs = single_dominant_stream ? (2 * 1024 * 1024)
                                             : (4 * 1024 * 1024);
-                jb = 4;
+                jb = auto_jb;
             }
             (void)max_px_sz;
             if (t_env)  t = t_env;
@@ -2615,7 +2716,7 @@ static bool compress_tovycip_archive(
 
     // Write PPGS archive (v2 layout)
     std::vector<uint8_t> out;
-    wr_bytes(out, TCIP_SIG, 4);
+    wr_bytes(out, TVCP_SIG, 4);
     out.push_back(2);                       // version 2 (multi-stream pixel)
     out.push_back(has_mode2 ? 1 : 0);
     wr_le32(out, (uint32_t)entries.size());
@@ -2913,6 +3014,307 @@ static bool compress_jng_to_tcij(
     return write_file(out_path, out);
 }
 
+/* ─── TCIP (preflate) — opt-in max-ratio whole-file recompression ─────────────
+ * Wire format:
+ *   4   TCIP_SIG
+ *   1   version (= 1)
+ *   1   flags   (reserved, 0)
+ *   2   filename_len (LE u16)
+ *   N   filename (UTF-8 basename of the source PNG/APNG)
+ *   8   orig_size (LE u64)   ; sanity-check at decode
+ *   8   blob_size (LE u64)
+ *   B   blob (preflate container of the whole source file)
+ */
+#ifdef USE_PREFLATE
+static bool compress_png_preflate(const std::string& png_path,
+                                  const std::string& out_path,
+                                  std::vector<uint8_t>* out_bytes = nullptr,
+                                  const uint8_t* sig = TCIP_SIG)
+{
+    namespace fs = std::filesystem;
+    auto raw = read_file(png_path);
+    if (raw.empty()) { snprintf(errormessage, MSG_SIZE, "cannot read input"); return false; }
+    // flags bit0: payload is the raw original (stored, no preflate). Used when
+    // the preflate container fails OR doesn't beat the original (e.g. MNG that
+    // is mostly already-compressed JPEG) — guarantees output never bloats.
+    std::vector<uint8_t> blob;
+    uint8_t flags = 0;
+    const std::vector<uint8_t>* payload = &blob;
+    if (!preflate_compress(raw, blob) || blob.size() >= raw.size()) {
+        flags = 1; payload = &raw;
+    }
+    std::string fname = fs::path(png_path).filename().string();
+    if (fname.size() > 0xFFFFu) fname.resize(0xFFFFu);
+
+    std::vector<uint8_t> out;
+    wr_bytes(out, sig, 4);
+    out.push_back(1); out.push_back(flags);
+    uint16_t nlen = (uint16_t)fname.size();
+    out.push_back((uint8_t)(nlen & 0xFF));
+    out.push_back((uint8_t)((nlen >> 8) & 0xFF));
+    out.insert(out.end(), fname.begin(), fname.end());
+    wr_le64(out, (uint64_t)raw.size());
+    wr_le64(out, (uint64_t)payload->size());
+    out.insert(out.end(), payload->begin(), payload->end());
+
+    if (verbosity >= 1)
+        fprintf(stdout, "  %s%c%c%c%c%s %s: %zu -> %zu (%.1f%%)%s\n", col(BC),
+                sig[0], sig[1], sig[2], sig[3], col(R),
+                fname.c_str(), raw.size(), out.size(),
+                raw.empty() ? 0.0 : 100.0 * out.size() / raw.size(),
+                flags ? " [stored]" : "");
+
+    if (out_bytes) { *out_bytes = std::move(out); return true; }
+    if (dry_run) return true;
+    return write_file(out_path, out);
+}
+
+static bool decompress_tcpf(const std::string& archive_path, const std::string& out_dir)
+{
+    namespace fs = std::filesystem;
+    auto buf = read_file(archive_path);
+    if (buf.size() < 22 ||
+        (memcmp(buf.data(), TCIP_SIG, 4) != 0 && memcmp(buf.data(), TCIM_SIG, 4) != 0)) {
+        snprintf(errormessage, MSG_SIZE, "bad TCIP/TCIM magic"); return false;
+    }
+    size_t pos = 4;
+    uint8_t ver = buf[pos++]; (void)ver;
+    uint8_t flags = buf[pos++];  // bit0: payload stored raw (no preflate)
+    uint16_t nlen = (uint16_t)(buf[pos] | (buf[pos + 1] << 8)); pos += 2;
+    if (nlen > buf.size() || pos > buf.size() - nlen) {
+        snprintf(errormessage, MSG_SIZE, "TCIP truncated filename"); return false;
+    }
+    std::string fname((const char*)buf.data() + pos, nlen); pos += nlen;
+    // never trust the stored name for path traversal — keep the basename only
+    fname = fs::path(fname).filename().string();
+    if (fname.empty()) fname = "out.png";
+    if (pos + 16 > buf.size()) {
+        snprintf(errormessage, MSG_SIZE, "TCIP truncated sizes"); return false;
+    }
+    uint64_t orig_sz = rd_le64(buf.data() + pos); pos += 8;
+    uint64_t blob_sz = rd_le64(buf.data() + pos); pos += 8;
+    if (blob_sz > buf.size() || pos > buf.size() - blob_sz) {
+        snprintf(errormessage, MSG_SIZE, "TCIP truncated blob"); return false;
+    }
+    std::vector<uint8_t> png;
+    if (flags & 1) {
+        // stored: the payload IS the original file bytes
+        png.assign(buf.begin() + pos, buf.begin() + pos + blob_sz);
+    } else if (!preflate_recreate(buf.data() + pos, blob_sz, png)) {
+        snprintf(errormessage, MSG_SIZE, "preflate recreate failed"); return false;
+    }
+    if (orig_sz != 0 && png.size() != orig_sz) {
+        snprintf(errormessage, MSG_SIZE, "TCIP size mismatch: got %zu, expected %llu",
+                 png.size(), (unsigned long long)orig_sz);
+        return false;
+    }
+    std::error_code ec;
+    fs::create_directories(out_dir, ec);
+    std::string outpath = (fs::path(out_dir) / fname).string();
+    if (dry_run) return true;
+    return write_file(outpath, png);
+}
+
+#ifdef USE_KANZI
+/* ─── TMCP (preflate-MAX) — preflate corrections + kanzi-TPAQX pixels ─────────
+ * Per frame: inflate IDAT (pixels) and preflate-split its deflate into (pixels,
+ * corrections). Pixels of all frames are concatenated and compressed once with
+ * kanzi TPAQX (best ratio on pixel data). Only the tiny corrections + zlib
+ * framing (2-byte header + 4-byte adler) + chunk sizes are stored per frame.
+ * Decode: kanzi-decode pixels, preflate-recreate the exact deflate, rebuild the
+ * zlib stream and IDAT/fdAT chunks. Byte-exact; extreme ratio; very slow.
+ */
+static const char* tcpm_transform() {
+    // RLT + TPAQX on the (filtered) pixels is the measured sweet spot; BWT hurts
+    // here because PNG row filters already decorrelate the data. 32 MiB blocks.
+    const char* e = getenv("PACKPNG_TMCP_T"); return e ? e : "RLT";
+}
+static const char* tcpm_entropy() {
+    const char* e = getenv("PACKPNG_TMCP_E"); return e ? e : "TPAQX";
+}
+
+static bool compress_png_preflate_max(const std::string& png_path,
+                                      const std::string& out_path,
+                                      std::vector<uint8_t>* out_bytes = nullptr)
+{
+    namespace fs = std::filesystem;
+    auto raw = read_file(png_path);
+    if (raw.empty()) { snprintf(errormessage, MSG_SIZE, "cannot read input"); return false; }
+    PngInfo info;
+    if (!parse_png(raw, info)) return false;
+
+    std::vector<uint8_t> big_px;   // all frames' inflated pixels (→ kanzi)
+    std::vector<uint8_t> fmeta;    // per-frame metadata
+    wr_le32(fmeta, (uint32_t)info.frames.size());
+    for (auto& fr : info.frames) {
+        if (fr.idat_raw.size() < 6) {
+            snprintf(errormessage, MSG_SIZE, "preflate-max: frame zlib too small"); return false;
+        }
+        // zlib stream = 2-byte header + deflate + 4-byte adler
+        const uint8_t* zl = fr.idat_raw.data();
+        size_t zlen = fr.idat_raw.size();
+        std::vector<uint8_t> deflate(zl + 2, zl + zlen - 4);
+        std::vector<uint8_t> plain, corr;
+        if (!preflate_split(deflate, plain, corr)) {
+            snprintf(errormessage, MSG_SIZE, "preflate-max: split failed (unsupported deflate)");
+            return false;
+        }
+        fmeta.push_back(fr.fctl.empty() ? 0 : 1);
+        if (!fr.fctl.empty()) {
+            if (fr.fctl.size() != 26) { snprintf(errormessage, MSG_SIZE, "bad fctl"); return false; }
+            fmeta.insert(fmeta.end(), fr.fctl.begin(), fr.fctl.end());
+        }
+        fmeta.push_back(fr.uses_idat ? 1 : 0);
+        if (!fr.uses_idat) wr_le32(fmeta, fr.first_seq);
+        fmeta.push_back(zl[0]); fmeta.push_back(zl[1]);               // zlib header
+        wr_bytes(fmeta, zl + zlen - 4, 4);                            // adler32
+        wr_le32(fmeta, (uint32_t)fr.chunk_szs.size());
+        for (uint32_t s : fr.chunk_szs) wr_le32(fmeta, s);
+        wr_le32(fmeta, (uint32_t)corr.size());
+        fmeta.insert(fmeta.end(), corr.begin(), corr.end());
+        wr_le64(fmeta, (uint64_t)plain.size());
+        big_px.insert(big_px.end(), plain.begin(), plain.end());
+    }
+
+    std::vector<uint8_t> kblob;
+    int jobs = g_solid_jobs > 0 ? g_solid_jobs : 4;
+    int blk = 32 * 1024 * 1024;  // large blocks = better ratio (TPAQX context)
+    if (const char* b = getenv("PACKPNG_TMCP_BLK")) { int v = atoi(b); if (v >= 65536) blk = v; }
+    if (!kanzi_solid_enc_pipe(big_px.data(), big_px.size(),
+                              tcpm_transform(), tcpm_entropy(), jobs,
+                              blk, kblob)) return false;
+
+    std::string fname = fs::path(png_path).filename().string();
+    if (fname.size() > 0xFFFFu) fname.resize(0xFFFFu);
+
+    std::vector<uint8_t> out;
+    wr_bytes(out, TMCP_SIG, 4);
+    out.push_back(1); out.push_back(0);
+    uint16_t nlen = (uint16_t)fname.size();
+    out.push_back((uint8_t)(nlen & 0xFF)); out.push_back((uint8_t)((nlen >> 8) & 0xFF));
+    out.insert(out.end(), fname.begin(), fname.end());
+    out.push_back(info.is_apng ? 1 : 0);
+    wr_le32(out, info.num_plays);
+    wr_le32(out, (uint32_t)info.pre.size());
+    out.insert(out.end(), info.pre.begin(), info.pre.end());
+    wr_le32(out, (uint32_t)info.post.size());
+    out.insert(out.end(), info.post.begin(), info.post.end());
+    wr_le32(out, (uint32_t)fmeta.size());
+    out.insert(out.end(), fmeta.begin(), fmeta.end());
+    wr_le64(out, (uint64_t)big_px.size());
+    wr_le64(out, (uint64_t)kblob.size());
+    out.insert(out.end(), kblob.begin(), kblob.end());
+
+    if (verbosity >= 1)
+        fprintf(stdout, "  %sTMCP%s %s: %zu -> %zu (%.1f%%)\n", col(BC), col(R),
+                fname.c_str(), raw.size(), out.size(), 100.0 * out.size() / raw.size());
+    if (out_bytes) { *out_bytes = std::move(out); return true; }
+    if (dry_run) return true;
+    return write_file(out_path, out);
+}
+
+static bool decompress_tcpm(const std::string& archive_path, const std::string& out_dir)
+{
+    namespace fs = std::filesystem;
+    auto buf = read_file(archive_path);
+    size_t sz = buf.size();
+    if (sz < 8 || memcmp(buf.data(), TMCP_SIG, 4) != 0) {
+        snprintf(errormessage, MSG_SIZE, "bad TMCP magic"); return false;
+    }
+    size_t pos = 4;
+    pos += 2;  // ver, flags
+    if (pos + 2 > sz) { snprintf(errormessage, MSG_SIZE, "TMCP trunc name"); return false; }
+    uint16_t nlen = (uint16_t)(buf[pos] | (buf[pos+1] << 8)); pos += 2;
+    if (nlen > sz || pos > sz - nlen) { snprintf(errormessage, MSG_SIZE, "TMCP trunc name"); return false; }
+    std::string fname((const char*)buf.data() + pos, nlen); pos += nlen;
+    fname = fs::path(fname).filename().string();
+    if (fname.empty()) fname = "out.png";
+    if (pos + 1 + 4 > sz) { snprintf(errormessage, MSG_SIZE, "TMCP trunc hdr"); return false; }
+    bool is_apng = buf[pos++] != 0; (void)is_apng;
+    uint32_t num_plays = rd_le32(buf.data() + pos); pos += 4; (void)num_plays;
+    auto rd_block = [&](std::vector<uint8_t>& dst) -> bool {
+        if (pos + 4 > sz) return false;
+        uint32_t L = rd_le32(buf.data() + pos); pos += 4;
+        if (L > sz || pos > sz - L) return false;
+        dst.assign(buf.begin() + pos, buf.begin() + pos + L); pos += L; return true;
+    };
+    std::vector<uint8_t> pre, post, fmeta;
+    if (!rd_block(pre) || !rd_block(post) || !rd_block(fmeta)) {
+        snprintf(errormessage, MSG_SIZE, "TMCP trunc sections"); return false;
+    }
+    if (pos + 16 > sz) { snprintf(errormessage, MSG_SIZE, "TMCP trunc px hdr"); return false; }
+    uint64_t px_raw = rd_le64(buf.data() + pos); pos += 8;
+    uint64_t kc     = rd_le64(buf.data() + pos); pos += 8;
+    static const uint64_t MAX_RAW = 1ull << 32;
+    if (px_raw > MAX_RAW || kc > sz || pos > sz - kc) {
+        snprintf(errormessage, MSG_SIZE, "TMCP trunc/implausible px"); return false;
+    }
+    std::vector<uint8_t> big_px;
+    if (!kanzi_solid_dec(buf.data() + pos, (size_t)kc, 4, big_px, (size_t)px_raw)) return false;
+
+    // walk fmeta + slice pixels, recreate each frame
+    const uint8_t* m = fmeta.data(); size_t msz = fmeta.size(), mp = 0;
+    if (mp + 4 > msz) { snprintf(errormessage, MSG_SIZE, "TMCP meta trunc"); return false; }
+    uint32_t nframes = rd_le32(m + mp); mp += 4;
+    if (nframes > 100000u) { snprintf(errormessage, MSG_SIZE, "TMCP implausible frames"); return false; }
+    std::vector<uint8_t> png_out;
+    wr_bytes(png_out, PNG_SIG, 8);
+    png_out.insert(png_out.end(), pre.begin(), pre.end());
+    size_t px_off = 0;
+    for (uint32_t i = 0; i < nframes; i++) {
+        FrameMeta fm; fm.mode = 1;
+        if (mp + 1 > msz) { snprintf(errormessage, MSG_SIZE, "TMCP frame meta truncated"); return false; }
+        if (m[mp++]) { if (mp + 26 > msz) { snprintf(errormessage, MSG_SIZE, "TMCP frame meta truncated"); return false; } fm.fctl.assign(m + mp, m + mp + 26); mp += 26; }
+        if (mp + 1 > msz) { snprintf(errormessage, MSG_SIZE, "TMCP frame meta truncated"); return false; }
+        fm.uses_idat = m[mp++] != 0;
+        if (!fm.uses_idat) { if (mp + 4 > msz) { snprintf(errormessage, MSG_SIZE, "TMCP frame meta truncated"); return false; } fm.first_seq = rd_le32(m + mp); mp += 4; }
+        if (mp + 6 > msz) { snprintf(errormessage, MSG_SIZE, "TMCP frame meta truncated"); return false; }
+        uint8_t h0 = m[mp], h1 = m[mp+1]; const uint8_t* adler = m + mp + 2; mp += 6;
+        if (mp + 4 > msz) { snprintf(errormessage, MSG_SIZE, "TMCP frame meta truncated"); return false; }
+        uint32_t nch = rd_le32(m + mp); mp += 4;
+        if (nch > (msz - mp) / 4) { snprintf(errormessage, MSG_SIZE, "TMCP frame meta truncated"); return false; }
+        for (uint32_t k = 0; k < nch; k++) { fm.chunk_szs.push_back(rd_le32(m + mp)); mp += 4; }
+        if (mp + 4 > msz) { snprintf(errormessage, MSG_SIZE, "TMCP frame meta truncated"); return false; }
+        uint32_t cl = rd_le32(m + mp); mp += 4;
+        if (cl > msz || mp > msz - cl) { snprintf(errormessage, MSG_SIZE, "TMCP frame meta truncated"); return false; }
+        const uint8_t* corr = m + mp; mp += cl;
+        if (mp + 8 > msz) { snprintf(errormessage, MSG_SIZE, "TMCP frame meta truncated"); return false; }
+        uint64_t pl = rd_le64(m + mp); mp += 8;
+        if (pl > big_px.size() || px_off > big_px.size() - pl) {
+            snprintf(errormessage, MSG_SIZE, "TMCP px slice OOB"); return false;
+        }
+        std::vector<uint8_t> plain(big_px.begin() + px_off, big_px.begin() + px_off + pl);
+        px_off += pl;
+        std::vector<uint8_t> deflate;
+        if (!preflate_deflate_recreate(plain, corr, cl, deflate)) {
+            snprintf(errormessage, MSG_SIZE, "preflate recreate failed"); return false;
+        }
+        // rebuild zlib stream = header(2) + deflate + adler(4); emit via mode-1 passthrough
+        fm.payload.clear(); fm.payload.reserve(2 + deflate.size() + 4);
+        fm.payload.push_back(h0); fm.payload.push_back(h1);
+        fm.payload.insert(fm.payload.end(), deflate.begin(), deflate.end());
+        fm.payload.insert(fm.payload.end(), adler, adler + 4);
+        if (!fm.fctl.empty()) {
+            uint32_t crc = chunk_crc((const uint8_t*)"fcTL", fm.fctl.data(), fm.fctl.size());
+            wr_be32(png_out, (uint32_t)fm.fctl.size());
+            wr_bytes(png_out, (const uint8_t*)"fcTL", 4);
+            wr_bytes(png_out, fm.fctl.data(), fm.fctl.size());
+            wr_be32(png_out, crc);
+        }
+        if (!emit_idat_or_fdat(png_out, fm)) return false;
+    }
+    png_out.insert(png_out.end(), post.begin(), post.end());
+    {
+        std::error_code ec;
+        fs::create_directories(out_dir, ec);
+        std::string outpath = (fs::path(out_dir) / fname).string();
+        if (dry_run) return true;
+        return write_file(outpath, png_out);
+    }
+}
+#endif // USE_KANZI
+#endif // USE_PREFLATE
+
 static bool decompress_tcij(
     const std::string& archive_path,
     const std::string& out_dir)
@@ -3118,7 +3520,7 @@ static bool decompress_tovycip_archive(
     namespace fs = std::filesystem;
     auto buf = read_file(archive_path);
     if (buf.size() < 10 ||
-        (memcmp(buf.data(), TCIP_SIG, 4) != 0 &&
+        (memcmp(buf.data(), TVCP_SIG, 4) != 0 &&
          memcmp(buf.data(), PPGS_SIG, 4) != 0)) {
         snprintf(errormessage, MSG_SIZE, "bad TCIP magic"); return false;
     }
@@ -3247,9 +3649,15 @@ static bool decompress_tovycip_archive(
     for (int s = 0; s < num_streams; s++) {
         if (sraw[s] == 0) continue;
         px_threads.emplace_back([&, s] {
-            int per_stream_jobs = (num_streams >= 2 && s == 0) ? 4
-                                : (num_streams >= 2)            ? 2
-                                                                : 4;
+            // Adaptive (g_solid_dec_jobs, set by main from hw/decode_pool): a
+            // single .ppg decode uses all cores across its kanzi blocks; a big
+            // batch drops to ~1 job each to avoid pool×jobs oversubscription.
+            // Falls back to the historical fixed 4/2 split when unset. The
+            // bigger stream 0 gets the full budget; secondary streams get half.
+            int base = (g_solid_dec_jobs > 0) ? g_solid_dec_jobs : 4;
+            int per_stream_jobs = (num_streams >= 2 && s == 0) ? base
+                                : (num_streams >= 2)            ? std::max(1, base / 2)
+                                                                : base;
             // Watchdog: corrupted bitstreams can drive kanzi into an internal
             // infinite loop. 30 s is generous (8MB of valid data decodes in ~25 ms);
             // if we hit the timeout the input is almost certainly malformed.
@@ -3405,19 +3813,35 @@ static void process_file(const std::string& inpath, const std::string& src_root 
         tick_bar();
         return;
     }
-    if (ft == F_TCIP || ft == F_TCIJ) {
-        // TCIP = PNG/APNG-derived solid archive; TCIJ = JNG-derived (v1.8).
-        // Both extract into outdir; both report input bytes only (output
-        // bytes for extract require a directory walk we skip).
+    if (ft == F_TVCP || ft == F_TCIJ || ft == F_TCIP || ft == F_TMCP || ft == F_TCIM) {
+        // TCIP = PNG/APNG-derived solid archive; TCIJ = JNG-derived (v1.8);
+        // TCIP = preflate whole-file (v1.9, -preflate); TMCP = preflate-max
+        // (v1.9, -preflate-max); TCIM = MNG whole-file preflate container (v1.9).
+        // All extract into outdir; all report input bytes.
         std::string odir = outdir.empty()
             ? fs::path(inpath).parent_path().string()
             : outdir;
         if (odir.empty()) odir = ".";
         std::error_code ec;
         uint64_t in_sz_a = (uint64_t)fs::file_size(inpath, ec);
-        bool ok = (ft == F_TCIP)
-            ? decompress_tovycip_archive(inpath, odir)
-            : decompress_tcij(inpath, odir);
+        bool ok;
+        if (ft == F_TVCP)      ok = decompress_tovycip_archive(inpath, odir);
+        else if (ft == F_TCIJ) ok = decompress_tcij(inpath, odir);
+        else if (ft == F_TCIP || ft == F_TCIM) {
+#ifdef USE_PREFLATE
+            ok = decompress_tcpf(inpath, odir);   // handles both TCIP and TCIM magics
+#else
+            ok = false;
+            snprintf(errormessage, MSG_SIZE, "TCIP/TCIM input requires a -DUSE_PREFLATE build");
+#endif
+        } else {  // F_TMCP
+#if defined(USE_PREFLATE) && defined(USE_KANZI)
+            ok = decompress_tcpm(inpath, odir);
+#else
+            ok = false;
+            snprintf(errormessage, MSG_SIZE, "TMCP input requires a -DUSE_PREFLATE -DUSE_KANZI build");
+#endif
+        }
         if (!ok) {
             std::lock_guard<std::mutex> lk(g_print_mutex);
             clear_bar();
@@ -3736,11 +4160,11 @@ static void list_ppg(const std::string& path) {
 static void show_help() {
     fprintf(stdout,
         "\n%spackPNG%s v%d.%d%s  •  by %s\n"
-        "PNG/APNG/JNG lossless recompressor — tovyCIP backend (kanzi BWT + zstd-19-long)\n\n"
+        "PNG/APNG/JNG/MNG lossless recompressor — tovyCIP backend (preflate + WebP-lossless; -fast for kanzi+zstd)\n\n"
         "Usage: packPNG [subcommand] [flags] file(s)\n\n"
         "Subcommands:\n"
-        "  a            compress only (.png/.apng/.jng → .ppg)\n"
-        "  x            decompress only (.ppg → .png/.apng/.jng)\n"
+        "  a            compress only (.png/.apng/.jng/.mng → .ppg)\n"
+        "  x            decompress only (.ppg → .png/.apng/.jng/.mng)\n"
         "  mix          both directions (default)\n"
         "  l / list     inspect .ppg files (no decompression)\n\n"
         "Flags:\n"
@@ -3770,17 +4194,17 @@ static void show_help() {
         "                 stored idat → zstd-19 with --long=27 (cheap init, fast decode)\n"
         "                 sections encoded in parallel; decode auto-detects idat codec by magic\n"
         "                 vs xz preset 6: ratio ≈tied, comp −37%%, decST −10%%, dec-th0 +12%%\n"
-        "  -tovycip     tovyCIP — Tovy Compresor de Imágenes PNG (DEFAULT, per-file)\n"
-        "                 Pipeline (always per-file in v1.7+):\n"
-        "                   pixels  → kanzi RLT+BWT+SRT+ZRLT/FPAQ\n"
-        "                   stored idat → zstd-19 with --long=27\n"
-        "                 1 PNG → 1 .ppg ; if outpaths collide they are renamed\n"
-        "                   (e.g. image.ppg → image(1).ppg → image(2).ppg).\n"
-        "  -tcip        alias of -tovycip (no behavioural difference).\n"
-        "  -solid       alias of -tovycip (legacy name from the v1.5/v1.6 archive\n"
-        "                 era; archive grouping was removed in v1.7).\n"
-        "  -perfile     opt out of the tovyCIP default and route through the\n"
-        "                 legacy per-file LZMA path (v1.0–v1.4 backend).\n"
+        "  -tovycip     tovyCIP — the DEFAULT PNG backend (no flag needed).\n"
+        "                 magic TCIP = Tovy Compresor de Imágenes PNG: preflate undoes\n"
+        "                 the deflate byte-exact, then WebP-lossless stores the image →\n"
+        "                 best ratio (≈ −54%% on real PNGs) with fast decode.\n"
+        "                 1 PNG → 1 .ppg ; colliding outpaths are renamed.\n"
+        "  -tcip        alias of -tovycip (tovyCIP == TCIP == the default backend).\n"
+        "  -solid       alias of -tovycip (legacy name).\n"
+        "  -fast        TVCP = Tovy Veloz Compresor PNG: old kanzi RLT+BWT+SRT+ZRLT/FPAQ\n"
+        "                 pixels + zstd-19 idat. Much faster encode/decode, weaker\n"
+        "                 ratio. Use when (de)compress speed matters most.\n"
+        "  -perfile     opt out to the legacy per-file LZMA path (v1.0–v1.4 backend).\n"
         "  -fastdec     skip filter-byte separation for files ≥4MB pixels (≈ −5 ms decode\n"
         "                 per big file, ≈ +1 KB ratio per affected file). Equivalent to\n"
         "                 -nofsep=4194304 / PACKPNG_NO_FSEP_ABOVE=4194304.\n"
@@ -3791,6 +4215,14 @@ static void show_help() {
         "                 trade-off: best ratio (≈ −0.5%% vs xz-6 on screenshots),\n"
         "                   slower encode (≈ −33%% throughput) and noticeably slower\n"
         "                   decode (~+130 ms / file). Use when ratio > read latency.\n"
+        "  -preflate    same as the default (preflate + WebP-lossless, magic TCIP);\n"
+        "                 kept as an explicit alias.\n"
+        "  -preflate-max TMCP = Tovy Máximo Compresor PNG. EXTREME RATIO: preflate\n"
+        "                 corrections + kanzi-TPAQX on the inflated pixels. Superseded\n"
+        "                 by the default (which beats it on ratio AND decode); archival.\n"
+        "  (MNG)        .mng inputs (incl. embedded JNG/Delta-PNG) → whole-file\n"
+        "                 preflate container (magic TCIM); store-raw fallback so the\n"
+        "                 output never bloats. Automatic; no flag needed.\n"
         "  -th<N>       N file-level threads (0=auto)\n"
         "  -sfth        single-file parallelism: 4 threads inside each file —\n"
         "                 parallel brute-force zlib match + parallel kanzi encode\n"
@@ -3886,11 +4318,19 @@ int main(int argc, char** argv)
             g_kanzi_level = arg[6] - '0';
         }
         else if (arg == "-kpng")      { use_kanzi = true; use_kpng = true; g_mode_explicit = true; }
-        else if (arg == "-solid"      // legacy alias
+        else if (arg == "-fast")      { use_kanzi = true; use_kpng = true; use_solid = true; g_mode_explicit = true; }  // old kanzi+zstd tovyCIP (fast enc/dec, weaker ratio)
+        else if (arg == "-solid"      // tovyCIP == TCIP == the default backend (now preflate+WebP)
               || arg == "-tovycip"
-              || arg == "-tcip")      { use_kanzi = true; use_kpng = true; use_solid = true; g_mode_explicit = true; }
+              || arg == "-tcip")      {
+            use_kanzi = true; use_kpng = true; use_solid = true; g_mode_explicit = true;
+#ifdef USE_PREFLATE
+            g_preflate = true;  // the tcip default backend is preflate+WebP (TCIP)
+#endif
+        }
         else if (arg == "-kpng-max")  { use_kanzi = true; use_kpng = true; use_solid = true; use_kpng_max = true; g_mode_explicit = true; }
         else if (arg == "-perfile")   { use_perfile = true; g_mode_explicit = true; }
+        else if (arg == "-preflate")  { g_preflate = true; }  // explicit; now also the default (no-flags) backend
+        else if (arg == "-preflate-max") { g_preflate = true; g_preflate_max = true; }  // extreme ratio (TMCP)
         else if (arg == "-fastdec")   g_nofsep_above = 4 * 1024 * 1024;  // skip filter_sep on files >= 4MB pixels
         else if (arg == "--no-color") no_color     = true;
         else if (arg == "-module")  { module_mode = true; wait_exit = false; }
@@ -4025,12 +4465,18 @@ int main(int argc, char** argv)
         int n_inputs = 0;
         for (auto& f : filelist) {
             FileType ft = detect_type(f.path);
-            if (ft == F_PNG || ft == F_JNG) n_inputs++;
+            if (ft == F_PNG || ft == F_JNG || ft == F_MNG) n_inputs++;
         }
         if (!g_mode_explicit && n_inputs >= 1 && (compress_only || !decompress_only)) {
             use_kanzi = true;
             use_kpng  = true;
             use_solid = true;
+#ifdef USE_PREFLATE
+            // v1.9 default: preflate (undo deflate, byte-exact) + WebP-lossless
+            // → best ratio with fast decode (magic TCIP). `-fast` opts out to the
+            // old kanzi+zstd tovyCIP (faster encode/decode, weaker ratio).
+            g_preflate = true;
+#endif
         }
     }
 
@@ -4052,7 +4498,7 @@ int main(int argc, char** argv)
         std::vector<std::string> skip_not_found;
         for (auto& f : filelist) {
             FileType ft = detect_type(f.path);
-            if (ft == F_PNG || ft == F_JNG) {
+            if (ft == F_PNG || ft == F_JNG || ft == F_MNG) {
                 paths.push_back(f.path);
                 types.push_back(ft);
                 src_roots.push_back(f.src_root);
@@ -4120,12 +4566,24 @@ int main(int argc, char** argv)
             fs::create_directories(outdir, ec);
         }
 
-        // File-level pool. Kanzi uses 4 jobs internally per file, so cap pool
-        // size at hw_concurrency / 2 (or honor -thN if user set it).
+        // File-level pool. Kanzi uses internal jobs per file, so cap pool size
+        // at hw_concurrency / 2 (or honor -thN if user set it).
         int pool = (g_threads_auto || num_threads <= 0)
             ? std::max(1, (int)std::thread::hardware_concurrency() / 2)
             : num_threads;
         if ((size_t)pool > paths.size()) pool = (int)paths.size();
+        // Adaptive per-file kanzi jobs: split the hardware threads across the
+        // file pool so concurrent threads (pool × jobs) ≈ hw. A single file then
+        // gets all cores (kanzi caps jobs by block count internally); a large
+        // batch drops to ~1-2 jobs each, avoiding the oversubscription that the
+        // old fixed jb=4 caused (measured: −10% on a 28-file batch, +86% on a
+        // single 14 MB file — output byte-identical either way). Env override
+        // (PACKPNG_SOLID_J) still wins inside the encoder.
+        if (g_solid_jobs == 0) {
+            int hw = (int)std::thread::hardware_concurrency();
+            if (hw < 1) hw = 1;
+            g_solid_jobs = std::max(1, hw / std::max(1, pool));
+        }
         std::atomic<size_t> next_idx{0};
         std::vector<std::thread> workers;
 
@@ -4146,9 +4604,27 @@ int main(int argc, char** argv)
             // v1.8: dispatch by file type — PNG/APNG → tovyCIP (TCIP),
             //                              JNG     → TCIJ wrapper.
             std::vector<uint8_t> archive_bytes;
-            bool enc_ok = (ftype == F_JNG)
-                ? compress_jng_to_tcij(path, outpath, &archive_bytes)
-                : compress_tovycip_archive(p1, outpath, r1, &archive_bytes);
+            bool enc_ok;
+            if (ftype == F_JNG)
+                enc_ok = compress_jng_to_tcij(path, outpath, &archive_bytes);
+#ifdef USE_PREFLATE
+            else if (ftype == F_MNG)  // MNG → whole-file preflate container (magic TCIM)
+                enc_ok = compress_png_preflate(path, outpath, &archive_bytes, TCIM_SIG);
+#endif
+#if defined(USE_PREFLATE) && defined(USE_KANZI)
+            else if (g_preflate_max) {  // -preflate-max: PNG/APNG → TMCP (preflate + kanzi-TPAQX)
+                enc_ok = compress_png_preflate_max(path, outpath, &archive_bytes);
+                // Low-level preflate rejects a few exotic deflate streams; the
+                // TCIP container handles them (internal store-raw fallback).
+                if (!enc_ok) { archive_bytes.clear(); enc_ok = compress_png_preflate(path, outpath, &archive_bytes); }
+            }
+#endif
+#ifdef USE_PREFLATE
+            else if (g_preflate)  // -preflate: PNG/APNG → TCIP whole-file container
+                enc_ok = compress_png_preflate(path, outpath, &archive_bytes);
+#endif
+            else
+                enc_ok = compress_tovycip_archive(p1, outpath, r1, &archive_bytes);
             if (!enc_ok) {
                 std::lock_guard<std::mutex> lk(g_print_mutex);
                 clear_bar();
@@ -4172,9 +4648,20 @@ int main(int argc, char** argv)
                 bool vok = false;
                 bool match = false;
                 if (write_file(vfile, archive_bytes)) {
-                    bool dec_ok = (ftype == F_JNG)
-                        ? decompress_tcij(vfile, vdir)
-                        : decompress_tovycip_archive(vfile, vdir);
+                    // Dispatch by the actual output magic (robust to the
+                    // preflate-max → TCIP fallback above).
+                    bool dec_ok;
+                    const uint8_t* mg = archive_bytes.data();
+                    bool big = archive_bytes.size() >= 4;
+                    if (ftype == F_JNG) dec_ok = decompress_tcij(vfile, vdir);
+#if defined(USE_PREFLATE) && defined(USE_KANZI)
+                    else if (big && memcmp(mg, TMCP_SIG, 4) == 0) dec_ok = decompress_tcpm(vfile, vdir);
+#endif
+#ifdef USE_PREFLATE
+                    else if (big && (memcmp(mg, TCIP_SIG, 4) == 0 || memcmp(mg, TCIM_SIG, 4) == 0))
+                        dec_ok = decompress_tcpf(vfile, vdir);  // TCIP (PNG) or TCIM (MNG)
+#endif
+                    else dec_ok = decompress_tovycip_archive(vfile, vdir);
                     if (dec_ok) {
                         // The single decoded file lives somewhere under vdir
                         // (basename or relative path inside vdir, depending
@@ -4274,7 +4761,8 @@ int main(int argc, char** argv)
             FileType ft = detect_type(f.path);
             if (ft == F_PNG && decompress_only) {
                 skip_decompress.push_back(f.path);
-            } else if ((ft == F_PPG || ft == F_TCIP || ft == F_TCIJ)
+            } else if ((ft == F_PPG || ft == F_TVCP || ft == F_TCIJ || ft == F_TCIP
+                        || ft == F_TMCP || ft == F_TCIM)
                        && compress_only) {
                 skip_compress.push_back(f.path);
             } else if (ft == F_JNG) {
@@ -4359,6 +4847,20 @@ int main(int argc, char** argv)
         }
         filelist = std::move(kept);
         g_total_files = (int)filelist.size();
+    }
+
+    // Adaptive decode jobs: the decode dispatch below runs up to `num_threads`
+    // files in parallel, but never more than there are files. Split hw across
+    // that *effective* pool so a single .ppg uses all cores (even under -th0,
+    // where the file pool collapses to 1) while a real batch stays at ~1 job
+    // per file. Clamping by filelist size is what the encode pool already does.
+    if (g_solid_dec_jobs == 0) {
+        int hw = (int)std::thread::hardware_concurrency();
+        if (hw < 1) hw = 1;
+        int dpool = num_threads >= 1 ? num_threads : 1;
+        if ((size_t)dpool > filelist.size() && !filelist.empty())
+            dpool = (int)filelist.size();
+        g_solid_dec_jobs = std::max(1, hw / dpool);
     }
 
     if (num_threads <= 1) {

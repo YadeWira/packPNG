@@ -3,3 +3,20 @@ source/packPNG_asan
 source/packPNG.exe
 *.o
 *.ppg
+source/bench/
+
+# Build artifacts of vendored deps — regenerated locally, NOT committed.
+# The preflate-rs staticlib (158 MB Rust target) and the kanzi .a's are built
+# with -march=native; committing them re-introduces the AVX-512 SIGILL footgun
+# on other CPUs. See source/vendor/*/BUILD.md / Makefile comments to rebuild.
+source/vendor/preflate-rs/lib/
+source/vendor/preflate-rs/target/
+source/vendor/kanzi-cpp/build/
+source/vendor/kanzi-cpp/build_win/
+
+# Release binaries — attached to GitHub Releases as assets, not tracked in-tree.
+source/packPNG-linux-*
+source/packPNG-windows-*
+
+# Local connection notes / credentials (VM SSH). MUST never be committed.
+CONEXION-IA.md

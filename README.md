@@ -1,6 +1,6 @@
 # packPNG
 
-**Lossless PNG/APNG/JNG recompressor.** Each input image gets its own `.ppg`
+**Lossless PNG/APNG/JNG/MNG recompressor.** Each input image gets its own `.ppg`
 output via the **tovyCIP** backend (kanzi BWT + zstd-19 with `--long=27`),
 which beats `xz -m6` on size, encode time and decode time on real PNG corpora
 — while staying byte-exact reversible to the original file.
@@ -9,9 +9,18 @@ which beats `xz -m6` on size, encode time and decode time on real PNG corpora
 packPNG a image.png        # → image.ppg     (PNG  → tovyCIP, TCIP magic)
 packPNG a animation.apng   # → animation.ppg (APNG → tovyCIP, TCIP magic)
 packPNG a image.jng        # → image.ppg     (JNG  → TCIJ wrapper)   [v1.8+]
+packPNG a clip.mng         # → clip.ppg      (MNG  → TCIM container)  [v1.9+]
 packPNG x image.ppg        # extract back to the original byte-exact file
 packPNG a -r -od out/ src/ # recurse, write all outputs into out/
 ```
+
+> **Magic naming (v2 scheme):** every magic spells out its backend.
+> **TCIP** = *Tovy Compresor de Imágenes PNG* (default: preflate + WebP-lossless),
+> **TVCP** = *Tovy Veloz Compresor PNG* (`-fast`: kanzi + zstd),
+> **TMCP** = *Tovy Máximo Compresor PNG* (`-preflate-max`: kanzi-TPAQX),
+> **TCIJ** = *Tovy Compresor de Imágenes JNG*, **TCIM** = *Tovy Compresor de Imágenes MNG*.
+> These magics drop pre-2.0 backward compatibility (old `.ppg`/`.tcip` from v1.x
+> used `TCIP` for the kanzi backend); 2.0 will freeze the format and stop breaking it.
 
 > **v1.8:** adds JNG (JPEG Network Graphics) container support. JNG inputs are
 > parsed into 3 sections (head / image / tail), each `zstd-19` compressed, and
@@ -93,12 +102,20 @@ Subcommands:
   mix          both directions (default)
   l / list     inspect .ppg files
 
-tovyCIP archive flags:
-  -tovycip     force tovyCIP archive mode (default for any PNG count)
-  -tcip        alias of -tovycip
-  -solid       legacy alias of -tovycip
-  -perfile     opt out → traditional per-file .ppg output
-  -kpng-max    tovyCIP + TPAQ entropy: max ratio, slow decode
+tovyCIP backend (tovyCIP == TCIP == the default PNG backend):
+  (default)    no flag needed. Since v1.9 the tovyCIP default is preflate +
+                 WebP-lossless (magic TCIP): undo the deflate byte-exact, store the
+                 image with WebP-lossless (method 5) → best ratio (≈ −54% on
+                 real-world PNGs) with fast decode (~40-90ms/file) and reasonable
+                 encode (~0.3-2.3s/file; scales with pixels). -fast for max speed.
+  -tcip        alias for the default (== -tovycip == -solid).
+  -fast        OLD tovyCIP: kanzi RLT+BWT+SRT+ZRLT/FPAQ + zstd-19 idat (magic TVCP).
+                 Much faster encode/decode, weaker ratio. Use when speed matters most.
+  -preflate    explicit alias of the default (preflate + WebP-lossless, TCIP).
+  -preflate-max  preflate + kanzi-TPAQX (TMCP). Superseded by the default (which now
+                 beats it on both ratio AND decode); archival/edge only.
+  -perfile     opt out → legacy per-file LZMA path (v1.0–v1.4 backend).
+  -kpng-max    old kanzi tovyCIP + TPAQ entropy (max ratio of the -fast family).
 
 Per-file (.ppg) flags:
   -m<1-9>      LZMA preset (default 6)
@@ -130,17 +147,22 @@ General:
 Every output uses the `.ppg` extension; the decoder selects the right path
 by reading the file's 4-byte magic, not its name.
 
-| Output | Magic | When you get it |
-|---|---|---|
-| **`.ppg`** | `TCIP` | **PNG/APNG → tovyCIP (default since v1.6)** |
-| **`.ppg`** | `TCIJ` | **JNG → TCIJ wrapper (v1.8+)** |
-| `.ppg`     | `PPG1` | Per-file packPNG (legacy v1.0–v1.4 path; opt-in via `-perfile`) |
-| `.tcip`    | `TCIP` | Legacy multi-entry tovyCIP archive (v1.5–v1.6) — still decodable |
-| `.ppgs`    | `PPGS` | Legacy multi-entry archive (v1.4–v1.5pre) — still decodable |
+| Output | Magic | Expansion | When you get it |
+|---|---|---|---|
+| **`.ppg`** | `TCIP` | **T**ovy **C**ompresor de **I**mágenes **P**NG | **PNG/APNG DEFAULT (preflate + WebP-lossless): max ratio + fast decode** |
+| `.ppg`     | `TVCP` | **T**ovy **V**eloz **C**ompresor **P**NG | PNG/APNG `-fast` (kanzi+zstd): faster encode/decode, weaker ratio |
+| **`.ppg`** | `TMCP` | **T**ovy **M**áximo **C**ompresor **P**NG | PNG/APNG `-preflate-max` (preflate + kanzi-TPAQX): extreme ratio |
+| **`.ppg`** | `TCIJ` | **T**ovy **C**ompresor de **I**mágenes **J**NG | JNG → wrapper (v1.8+) |
+| **`.ppg`** | `TCIM` | **T**ovy **C**ompresor de **I**mágenes **M**NG | MNG → whole-file preflate container (v1.9+); store-raw fallback so output never bloats |
+| `.ppg`     | `PPG1` | — | Per-file packPNG (legacy v1.0–v1.4 path; opt-in via `-perfile`) |
+| `.ppgs`    | `PPGS` | — | Legacy multi-entry archive (v1.4–v1.5pre) — still decodable |
 
-The decoder accepts every historical `.ppg` version (v1..v15), every `.ppgs`
-archive, every `.tcip` archive produced by earlier releases, and the new
-`TCIJ` wrapper introduced in v1.8. Round-trip is byte-exact for all of them.
+The decoder still accepts the historical per-file `.ppg` versions (v1..v15) and
+the `.ppgs` archives. **The v2 magic scheme drops pre-2.0 compatibility for the
+solid backends**: `TCIP` now means the preflate+WebP default (old v1.x `.ppg`/`.tcip`
+used `TCIP` for the kanzi backend, which is now `TVCP`). Version 2.0 will freeze the
+wire format and stop breaking it. Round-trip is byte-exact for everything the
+current build produces.
 
 ### TCIJ wire format (v1.8, JNG inputs)
 
@@ -161,6 +183,33 @@ archive, every `.tcip` archive produced by earlier releases, and the new
 Reconstruction is `JNG_SIG (8 B) + head + image + tail`; original chunk
 length / type / data / CRC bytes survive untouched, so byte-exact roundtrip
 is guaranteed regardless of how the source JNG was encoded.
+
+### TCIM (v1.9, MNG inputs)
+
+MNG (Multiple-image Network Graphics) is a container that embeds whole PNG,
+JNG and Delta-PNG datastreams plus zlib-compressed ancillary chunks. Level-A
+support treats the `.mng` as one opaque blob and runs it through the **preflate
+whole-file container** (the same backend as `-preflate`): every embedded
+deflate/zlib stream is undone to plain bytes + byte-exact corrections, then the
+whole thing is recompressed. The wire format is identical to `TCIP` — only the
+4-byte magic differs (`TCIM`):
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 4 | `TCIM` magic |
+| 4 | 1 | version (= 1) |
+| 5 | 1 | flags — bit0: payload is stored raw (no preflate) |
+| 6 | 2 | filename_len (LE u16) |
+| 8 | N | filename (UTF-8, original `.mng` basename) |
+| … | 8 | original size (LE u64) |
+| … | 8 | payload size (LE u64) |
+| … | P | payload (preflate container, or raw original if flags bit0 set) |
+
+If the preflate container fails or doesn't beat the original (e.g. an MNG that
+is mostly already-compressed JPEG), the **store-raw fallback** kicks in
+(flags bit0 = 1, payload = original bytes), so the output never bloats beyond
+the ~31-byte header. Measured on real MNGs: `fire6.mng` 40.7 %, `abydos.mng`
+71.8 %, `input.mng` 83.5 %, `EXAMPLE2.MNG` 94.3 % — all byte-exact round-trip.
 
 ## Robustness
 
